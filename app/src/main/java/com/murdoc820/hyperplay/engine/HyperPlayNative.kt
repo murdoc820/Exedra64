@@ -79,6 +79,8 @@ object HyperPlayNative {
     @JvmStatic external fun nativeDirectDetachSurface()
     @JvmStatic external fun nativeDirectPresentTestFrame(): Boolean
     @JvmStatic external fun nativeDirectPresentFps(): Float
+    /** FPS reales del juego (Present), sin repeticiones ni sintéticos. */
+    @JvmStatic external fun nativeGameFps(): Float
     /** Frames presentados por DirectVulkanBridge desde que arrancó el proceso. */
     @JvmStatic external fun nativeDirectFramesPresented(): Long
     @JvmStatic external fun nativeDirectStartAudio(rate: Int, channels: Int): Boolean

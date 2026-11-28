@@ -21,6 +21,10 @@ void setFpsCap(int fps) noexcept;
 void setMainThread(pid_t tid) noexcept;
 [[nodiscard]] pid_t mainThread() noexcept;
 
+/// Hilo de render invitado (D3D9) y trabajador nativo Vulkan (`d3d9-worker`) para ADPF / afinidad 2+6.
+void setRenderThread(pid_t tid) noexcept;
+void setRenderWorkerThread(pid_t tid) noexcept;
+
 /// Protección térmica: true = relaja el anclaje a Prime (todos los núcleos). Reversible.
 void setThermalRelax(bool relax) noexcept;
 [[nodiscard]] bool thermalRelaxed() noexcept;
@@ -29,6 +33,9 @@ void setThermalRelax(bool relax) noexcept;
 /// informa a ADPF del trabajo real del frame. Con el juego en pausa (Quick Resume / segundo
 /// plano) bloquea aquí hasta reanudar: el hilo de render se queda quieto y el principal le espera.
 void paceFrame() noexcept;
+
+/// FPS reales del juego (llamadas a paceFrame, ventana de 500 ms); 0 si no hay frames hace > 1 s.
+[[nodiscard]] float gameFps() noexcept;
 
 /// Pausa / reanuda el juego (Quick Resume, app en segundo plano, pantalla apagada).
 void setPaused(bool paused) noexcept;

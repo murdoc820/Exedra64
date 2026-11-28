@@ -447,7 +447,10 @@ class PerfMonitor(
     private val context: Context,
     private val sources: PerfSources = PerfSources(),
     private val frameCounter: () -> Long = HyperPlayNative::nativeDirectFramesPresented,
-    private val presentFps: () -> Float = HyperPlayNative::nativeDirectPresentFps,
+    // FPS reales del juego; si aún no hay muestra, cae a las presentaciones del swapchain.
+    private val presentFps: () -> Float = {
+        HyperPlayNative.nativeGameFps().takeIf { it > 0f } ?: HyperPlayNative.nativeDirectPresentFps()
+    },
 ) {
     private val clkTck = runCatching { Os.sysconf(OsConstants._SC_CLK_TCK) }.getOrDefault(100L).takeIf { it > 0 } ?: 100L
     private val cores = runCatching { Os.sysconf(OsConstants._SC_NPROCESSORS_CONF).toInt() }.getOrDefault(0)

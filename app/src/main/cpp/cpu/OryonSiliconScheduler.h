@@ -72,6 +72,7 @@ private:
     void* adpfSession_ = nullptr;
     std::mutex frameMutex_;
     void* frameSession_ = nullptr;
+    size_t frameTidCount_ = 0;
     bool frameSessionFailed_ = false;
     int64_t frameTargetNs_ = 0;
 };

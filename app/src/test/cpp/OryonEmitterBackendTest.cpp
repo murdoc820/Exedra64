@@ -5279,6 +5279,164 @@ void testCoreclrNameHash() {
     }
 }
 
+void testX87NativeExtended() {
+    CHECK(configureBackend(false));
+
+    struct alignas(16) Buf {
+        double d0;
+        double d1;
+        float f0;
+        int32_t i0;
+        int32_t i1;
+        int32_t i2;
+        int16_t cwTrunc;
+        int16_t cwFloor;
+        int16_t cwNearest;
+        uint16_t swOut;
+    } buf{};
+    buf.f0 = 9.0f;
+    buf.i0 = 7;
+    buf.i1 = -3;
+    buf.cwTrunc = 0x0F7F;
+    buf.cwFloor = 0x077F;
+    buf.cwNearest = 0x037F;
+    buf.d1 = -2.75;
+
+    // 1) FNINIT, FLDZ, FLD1, FCHS, FABS, FLD f0 (9.0), FSQRT -> 3.0, FADD -> 4.0, FSTP d0
+    Bytes code1;
+    movRegImm64(code1, 0, reinterpret_cast<uintptr_t>(&buf));
+    append(code1, {0xDB, 0xE3});              // fninit
+    append(code1, {0xD9, 0xEE});              // fldz -> 0
+    append(code1, {0xD9, 0xE8});              // fld1 -> 1, 0
+    append(code1, {0xD9, 0xE0});              // fchs -> -1, 0
+    append(code1, {0xD9, 0xE1});              // fabs -> 1, 0
+    append(code1, {0xD9, 0x40, 0x10});        // fld dword [rax+0x10] (f0=9.0) -> 9, 1, 0
+    append(code1, {0xD9, 0xFA});              // fsqrt -> 3, 1, 0
+    append(code1, {0xDE, 0xC1});              // faddp st(1), st(0) -> 4, 0
+    append(code1, {0xDD, 0x18});              // fstp qword [rax] (d0=4.0)
+    append(code1, {0xDF, 0xE0});              // fnstsw ax
+    append(code1, {0xC3});
+    const uint64_t sw1 = runCode(code1);
+    CHECK_EQ(buf.d0, 4.0);
+    // tras fninit + 3 pushes - 2 pops -> top == 7
+    CHECK_EQ((sw1 >> 11) & 7u, 7u);
+
+    // 2) FILD / FIADD / FLDCW / FISTP / FISTTP
+    Bytes code2;
+    movRegImm64(code2, 0, reinterpret_cast<uintptr_t>(&buf));
+    append(code2, {0xDB, 0xE3});              // fninit
+    append(code2, {0xDB, 0x40, 0x14});        // fild dword [rax+0x14] (i0=7)
+    append(code2, {0xDA, 0x40, 0x18});        // fiadd dword [rax+0x18] (i1=-3) -> 4.0
+    append(code2, {0xDD, 0x40, 0x08});        // fld qword [rax+0x08] (d1=-2.75)
+    append(code2, {0xD9, 0x68, 0x20});        // fldcw [rax+0x20] (trunc)
+    append(code2, {0xDB, 0x50, 0x1C});        // fist dword [rax+0x1C] -> i2 = -2
+    append(code2, {0xD9, 0x68, 0x22});        // fldcw [rax+0x22] (floor)
+    append(code2, {0xDB, 0x58, 0x14});        // fistp dword [rax+0x14] -> i0 = -3
+    append(code2, {0xD9, 0x68, 0x24});        // fldcw [rax+0x24] (nearest)
+    append(code2, {0xDB, 0x48, 0x18});        // fisttp dword [rax+0x18] -> i1 = 4
+    append(code2, {0xC3});
+    runCode(code2);
+    CHECK_EQ(buf.i2, -2);
+    CHECK_EQ(buf.i0, -3);
+    CHECK_EQ(buf.i1, 4);
+
+    // 3) FCOM / FCOMP / FNSTSW AX / FNSTSW m16 + FCOMIP + Jcc
+    Bytes code3;
+    movRegImm64(code3, 0, reinterpret_cast<uintptr_t>(&buf));
+    append(code3, {0xDB, 0xE3});              // fninit
+    append(code3, {0xD9, 0xE8});              // fld1 (1.0)
+    append(code3, {0xD9, 0xEE});              // fldz (0.0) -> ST(0)=0.0, ST(1)=1.0
+    append(code3, {0xD8, 0xD1});              // fcom st(1) -> 0 < 1 -> C0=1 (0x0100)
+    append(code3, {0xDD, 0x78, 0x26});        // fnstsw [rax+0x26]
+    append(code3, {0xDF, 0xF1});              // fcomip st(0), st(1) -> CF=1, ZF=0, PF=0, pops 0.0
+    append(code3, {0x72, 0x05});              // jb +5 (saltar si CF=1)
+    append(code3, {0xB8, 0x00, 0x00, 0x00, 0x00});  // mov eax, 0
+    append(code3, {0xDD, 0xD8});              // fstp st(0) (pop 1.0)
+    append(code3, {0xB8, 0x39, 0x05, 0x00, 0x00});  // mov eax, 1337
+    append(code3, {0xC3});
+    CHECK_EQ(runCode(code3), 1337u);
+    CHECK_EQ(buf.swOut & 0x4500u, 0x0100u);
+
+    // 4) FRNDINT + NaN con FCOMIP -> PF=1, ZF=1, CF=1 (JP debe saltar)
+    Bytes code4;
+    movRegImm64(code4, 0, reinterpret_cast<uintptr_t>(&buf));
+    append(code4, {0xDB, 0xE3});              // fninit
+    append(code4, {0xDD, 0x40, 0x08});        // fld qword [rax+8] (d1=-2.75)
+    append(code4, {0xD9, 0xFC});              // frndint -> -3.0 (nearest)
+    append(code4, {0xDD, 0x18});              // fstp qword [rax] (d0=-3.0)
+    append(code4, {0xC3});
+    runCode(code4);
+    CHECK_EQ(buf.d0 == -3.0, 1u);
+
+    Bytes code5;
+    buf.d0 = std::numeric_limits<double>::quiet_NaN();
+    movRegImm64(code5, 0, reinterpret_cast<uintptr_t>(&buf));
+    append(code5, {0xDB, 0xE3});              // fninit
+    append(code5, {0xD9, 0xE8});              // fld1
+    append(code5, {0xDD, 0x00});              // fld qword [rax] (NaN)
+    append(code5, {0xDF, 0xF1});              // fcomip st(0), st(1)
+    append(code5, {0x7A, 0x06});              // jp +6
+    append(code5, {0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3});  // mov eax, 0; ret
+    append(code5, {0xDD, 0xD8});              // fstp st(0)
+    append(code5, {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3});  // mov eax, 42; ret
+    CHECK_EQ(runCode(code5), 42u);
+
+    // 5) FXAM (empty, +0.0, -normal, +Inf, NaN)
+    auto runFxam = [&](bool empty, double val) -> uint16_t {
+        buf.d0 = val;
+        Bytes c;
+        movRegImm64(c, 0, reinterpret_cast<uintptr_t>(&buf));
+        append(c, {0xDB, 0xE3});  // fninit
+        if (!empty) append(c, {0xDD, 0x00});  // fld qword [rax]
+        append(c, {0xD9, 0xE5});              // fxam
+        append(c, {0xDF, 0xE0});              // fnstsw ax
+        append(c, {0xC3});
+        return static_cast<uint16_t>(runCode(c) & 0x4700u);
+    };
+    CHECK_EQ(runFxam(true, 0.0), 0x4100u);                                    // empty -> C0|C3
+    CHECK_EQ(runFxam(false, 0.0), 0x4000u);                                   // +0 -> C3
+    CHECK_EQ(runFxam(false, -3.5), 0x0600u);                                  // -normal -> C1|C2
+    CHECK_EQ(runFxam(false, std::numeric_limits<double>::infinity()), 0x0500u); // +inf -> C0|C2
+    CHECK_EQ(runFxam(false, std::numeric_limits<double>::quiet_NaN()), 0x0100u); // NaN -> C0
+}
+
+static uint32_t fast32DummySum5(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {
+    return a + b * 2 + c * 3 + d * 4 + e * 5;
+}
+
+void testFast32TableIndirect() {
+    alignas(16) static OryonEmitterBackend::Fast32AliasEntry tbl[16]{};
+    tbl[5] = {reinterpret_cast<uintptr_t>(&fast32DummySum5), 5, 0, {}};
+    const uintptr_t oldBase = OryonEmitterBackend::fast32AliasBase.exchange(0x7F000000u);
+    const auto* oldTbl = OryonEmitterBackend::fast32Table.exchange(tbl);
+    auto* oldInd = OryonEmitterBackend::fast32Indirect.exchange(
+        [](CpuContext*, uint32_t, uint32_t) -> uint32_t { return 1; });
+
+    CHECK(configureBackend(true));
+    Bytes code;
+    // push 5, 4, 3, 2, 1 (stdcall 5 args); mov eax, 0x7F000050 (idx 5); call eax; ret
+    append(code, {0x6A, 0x05, 0x6A, 0x04, 0x6A, 0x03, 0x6A, 0x02, 0x6A, 0x01});
+    append(code, {0xB8, 0x50, 0x00, 0x00, 0x7F});  // mov eax, 0x7F000050
+    append(code, {0xFF, 0xD0});                    // call eax
+    append(code, {0xC3});                          // ret (ESP debe estar limpio tras stdcall!)
+    const uint64_t r = runCode(code, true);
+    CHECK_EQ(r, 1u + 4u + 9u + 16u + 25u);  // 55
+
+    // Tail-call (JMP EAX) con retAddr simulado en la pila: call helper -> jmp eax; ret
+    Bytes tailCode;
+    append(tailCode, {0x6A, 0x05, 0x6A, 0x04, 0x6A, 0x03, 0x6A, 0x02, 0x6A, 0x01});
+    append(tailCode, {0xE8, 0x01, 0x00, 0x00, 0x00});  // call +1 (salta sobre C3)
+    append(tailCode, {0xC3});                          // ret final
+    append(tailCode, {0xB8, 0x50, 0x00, 0x00, 0x7F});  // mov eax, 0x7F000050
+    append(tailCode, {0xFF, 0xE0});                    // jmp eax (tail call stdcall)
+    const uint64_t rt = runCode(tailCode, true);
+    CHECK_EQ(rt, 55u);
+
+    OryonEmitterBackend::fast32AliasBase.store(oldBase);
+    OryonEmitterBackend::fast32Table.store(oldTbl);
+    OryonEmitterBackend::fast32Indirect.store(oldInd);
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -5492,6 +5650,10 @@ int main() {
     testCrossBlockDeadFlags();
     testPshufLwHw();
     testMonoCrtStrchr();
+    std::printf("testX87NativeExtended\n");
+    testX87NativeExtended();
+    std::printf("testFast32TableIndirect\n");
+    testFast32TableIndirect();
 
     std::printf("\nOryonEmitterBackendTest: %d comprobaciones, %d fallos\n", g_checks, g_failures);
     if (g_failures == 0) {

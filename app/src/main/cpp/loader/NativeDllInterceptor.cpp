@@ -102,6 +102,8 @@ std::mutex s_trampolineMutex;
 std::unordered_set<uintptr_t> s_registeredTrampolines;
 std::unordered_map<uintptr_t, std::string> s_trampolineNames;
 std::atomic<uint64_t> s_trampolineGen{1};
+std::atomic<uintptr_t> s_trampolineMin{UINTPTR_MAX};
+std::atomic<uintptr_t> s_trampolineMax{0};
 
 DirectVulkanBridge& directVulkanBridge() {
     return DirectVulkanBridge::shared();  // misma instancia que la superficie de Kotlin
@@ -111,7 +113,13 @@ void registerTrampolineAddress(void* ptr, const std::string& name = "") {
     if (ptr == nullptr) return;
     std::lock_guard<std::mutex> lock(s_trampolineMutex);
     const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-    if (s_registeredTrampolines.insert(addr).second) s_trampolineGen.fetch_add(1, std::memory_order_release);
+    if (s_registeredTrampolines.insert(addr).second) {
+        uintptr_t mn = s_trampolineMin.load(std::memory_order_relaxed);
+        while (addr < mn && !s_trampolineMin.compare_exchange_weak(mn, addr, std::memory_order_relaxed)) {}
+        uintptr_t mx = s_trampolineMax.load(std::memory_order_relaxed);
+        while (addr > mx && !s_trampolineMax.compare_exchange_weak(mx, addr, std::memory_order_relaxed)) {}
+        s_trampolineGen.fetch_add(1, std::memory_order_release);
+    }
     if (!name.empty()) {
         s_trampolineNames[addr] = name;
     }
@@ -158,6 +166,7 @@ uint8_t* s_region = nullptr;
 size_t s_used = 0;
 constexpr size_t kRegionSize = 1u << 20;  // 65536 entradas
 constexpr size_t kEntry = 16;
+alignas(16) OryonEmitterBackend::Fast32AliasEntry s_fast32Table[kRegionSize / kEntry]{};
 
 uint8_t* region() {
     if (s_region != nullptr) return s_region;
@@ -174,6 +183,7 @@ uint8_t* region() {
         mprotect(p, kRegionSize, PROT_READ);
         s_region = static_cast<uint8_t*>(p);
         OryonEmitterBackend::fast32AliasBase.store(reinterpret_cast<uintptr_t>(p));  // CALL indirectos rápidos
+        OryonEmitterBackend::fast32Table.store(s_fast32Table);
         __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Alias de 32 bits en %p (%zu entradas)", p, kRegionSize / kEntry);
         break;
     }
@@ -202,10 +212,23 @@ uintptr_t lowFor(void* host, const std::string& name) {
         if (const auto it = s_hostToLow.find(h); it != s_hostToLow.end()) return it->second;
         uint8_t* r = region();
         if (r == nullptr || s_used + kEntry > kRegionSize) return 0;
+        const size_t idx = s_used / kEntry;
         low = reinterpret_cast<uintptr_t>(r + s_used);
         s_used += kEntry;
         s_hostToLow[h] = low;
         s_lowToHost[low] = h;
+        // Rellenar entrada directa para emitFastIndirect32 en llamadas D3D9 / Win32 no bloqueantes (stdcall <= 8 args).
+        bool fastBlocking = false;
+        const bool isFastD3d9 = (name.rfind("d3d9.dll!", 0) == 0 &&
+                                 name != "d3d9.dll!IDirect3DDevice9#17" &&
+                                 name != "d3d9.dll!IDirect3DSwapChain9#3");
+        const bool isFastWin = OryonEmitterBackend::lookupFastNative(h, fastBlocking) && !fastBlocking;
+        if (isFastD3d9 || isFastWin) {
+            w32arity::Arity ar{};
+            if (w32arity::lookup(host, ar) && !ar.variadic && ar.wideMask == 0 && ar.slots <= 8) {
+                s_fast32Table[idx] = {h, ar.slots, 0, {}};
+            }
+        }
     }
     registerTrampolineAddress(reinterpret_cast<void*>(low), name.empty() ? findTrampolineName(h) : name);
     return low;
@@ -2062,6 +2085,9 @@ void NativeDllInterceptor::init(LoadedPeImage* image) {
         fast(&win_FlsSetValue, false);
         fast(&win_GetCurrentThreadId, false);
         fast(&win_GetCurrentProcessId, false);
+        fast(&win_GetCurrentProcess, false);
+        fast(&win_SwitchToThread, true);
+        fast(&win_Sleep, true);
         fast(&win_GetCurrentThread, false);
         fast(&win_GetLastError, false);
         fast(&win_SetLastError, false);
@@ -2083,6 +2109,13 @@ void NativeDllInterceptor::init(LoadedPeImage* image) {
         fast(&win_WakeByAddress, false);
         fast(&win_WakeByAddressAll, false);
         fast(&win_WaitOnAddress, true);
+        fast(&win_SetEvent, false);
+        fast(&win_ResetEvent, false);
+        fast(&win_ReleaseSemaphore, false);
+        fast(&win_InterlockedPushEntrySList, false);
+        fast(&win_InterlockedPopEntrySList, false);
+        fast(&win_GetKeyState, false);
+        fast(&win_WaitForSingleObject, true);
         // 32 bits: la IAT guarda alias bajos; solo se aceptan stdcall con aridad conocida y sin argumentos de 64 bits.
         OryonEmitterBackend::fast32Host.store([](uintptr_t a) -> uintptr_t {
             return w32alias::isAlias(a) ? w32alias::hostFor(a) : 0;
@@ -2226,6 +2259,10 @@ void* NativeDllInterceptor::getOrCreateDynamicStub(const std::string& dllName, c
 
 bool NativeDllInterceptor::isRegisteredTrampoline(uintptr_t target) noexcept {
     if (target == 0) return false;
+    if (target < s_trampolineMin.load(std::memory_order_relaxed) ||
+        target > s_trampolineMax.load(std::memory_order_relaxed)) {
+        return false;
+    }
     // Se consulta en cada búsqueda lenta del despachador de todos los hilos: caché por hilo
     // invalidada cuando se registra un trampolín nuevo (s_trampolineGen).
     thread_local std::unordered_map<uintptr_t, bool> t_known;
@@ -4755,6 +4792,19 @@ void OutputDebugStringA1(const char* s) {
 }
 
 void* resolve(const std::string& dll, const std::string& fn) {
+    static const bool s_fastReg = []() {
+        const auto reg = [](auto f) {
+            OryonEmitterBackend::registerFastNative(reinterpret_cast<uintptr_t>(f), false);
+        };
+        reg(&D3DXMatrixInverse);
+        reg(&PerfBeginEvent);
+        reg(&PerfEndEvent);
+        reg(&PerfMarker);
+        reg(&PerfSetOptions);
+        reg(&PerfZero0);
+        return true;
+    }();
+    (void)s_fastReg;
     static const std::unordered_map<std::string, void*> kMap = {
         {"D3DXMatrixInverse", w32arity::hpFn(&D3DXMatrixInverse)},
         {"D3DXCheckVersion", w32arity::hpFn(&D3DXCheckVersion)},
@@ -5506,11 +5556,27 @@ void* NativeDllInterceptor::resolveNativeSymbol(const std::string& dllName, cons
         else if (funcName == "SetHandleCount") result = w32arity::hpFn(&hp_SetHandleCount);
         else if (funcName == "GetThreadTimes") result = w32arity::hpFn(&hp_GetThreadTimes);
         else if (funcName == "GetVersion") result = w32arity::hpFn(&hp_GetVersion);
-        else if (funcName == "InterlockedIncrement") result = w32arity::hpFn(&hp_InterlockedIncrement);
-        else if (funcName == "InterlockedDecrement") result = w32arity::hpFn(&hp_InterlockedDecrement);
-        else if (funcName == "InterlockedExchange") result = w32arity::hpFn(&hp_InterlockedExchange);
-        else if (funcName == "InterlockedExchangeAdd") result = w32arity::hpFn(&hp_InterlockedExchangeAdd);
-        else if (funcName == "InterlockedCompareExchange") result = w32arity::hpFn(&hp_InterlockedCompareExchange);
+        else if (funcName == "InterlockedIncrement" || funcName == "InterlockedDecrement" ||
+                 funcName == "InterlockedExchange" || funcName == "InterlockedExchangeAdd" ||
+                 funcName == "InterlockedCompareExchange") {
+            static const bool s_fastInterlocked = []() {
+                const auto reg = [](auto f) {
+                    OryonEmitterBackend::registerFastNative(reinterpret_cast<uintptr_t>(f), false);
+                };
+                reg(&hp_InterlockedIncrement);
+                reg(&hp_InterlockedDecrement);
+                reg(&hp_InterlockedExchange);
+                reg(&hp_InterlockedExchangeAdd);
+                reg(&hp_InterlockedCompareExchange);
+                return true;
+            }();
+            (void)s_fastInterlocked;
+            if (funcName == "InterlockedIncrement") result = w32arity::hpFn(&hp_InterlockedIncrement);
+            else if (funcName == "InterlockedDecrement") result = w32arity::hpFn(&hp_InterlockedDecrement);
+            else if (funcName == "InterlockedExchange") result = w32arity::hpFn(&hp_InterlockedExchange);
+            else if (funcName == "InterlockedExchangeAdd") result = w32arity::hpFn(&hp_InterlockedExchangeAdd);
+            else result = w32arity::hpFn(&hp_InterlockedCompareExchange);
+        }
         else if (funcName == "InterlockedCompareExchange64") result = w32arity::hpFn(&hp_InterlockedCompareExchange64);
         else if (funcName == "CreateIoCompletionPort") result = w32arity::hpFn(&win_CreateIoCompletionPort);
         else if (funcName == "GetQueuedCompletionStatus") result = w32arity::hpFn(&win_GetQueuedCompletionStatus);
@@ -6623,6 +6689,10 @@ void* NativeDllInterceptor::win_CreateFileW(const wchar_t* lpFileName, uint32_t 
     if (!lpFileName || !s_activeImage) return handleFromFd(-1);
 
     const std::string rawPath = wcharToUtf8(lpFileName);
+    if (rawPath.empty()) {
+        win_SetLastError(3);  // ERROR_PATH_NOT_FOUND
+        return handleFromFd(-1);
+    }
     std::string realPath = BionicPeLoader::resolveVirtualPath(*s_activeImage, rawPath);
     if ((dwDesiredAccess & 0x40000000u) == 0) realPath = unityBootConfigOverlay(realPath);
 
@@ -7722,6 +7792,10 @@ uint32_t NativeDllInterceptor::win_GetCurrentThreadId() {
 
 void NativeDllInterceptor::win_Sleep(uint32_t dwMilliseconds) {
     s_kernel32Calls.fetch_add(1);
+    if (dwMilliseconds == 0) {
+        sched_yield();
+        return;
+    }
     struct timespec ts;
     ts.tv_sec = dwMilliseconds / 1000;
     ts.tv_nsec = (dwMilliseconds % 1000) * 1000000L;

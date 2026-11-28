@@ -5,24 +5,34 @@
 
 #include <android/log.h>
 #include <sys/system_properties.h>
+#include <time.h>
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <string>
+#include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
 #include "../loader/D3D11Sampler.h"
 #include "D3D9ShaderToSpirv.h"
 #include "DirectVulkanBridge.h"
+#include "HyperFrameGen.h"
 #include "PresentOptions.h"
 #include "PresentSpv.h"
+#include "PresentSgsrSpv.h"
+#include "loader/FramePacing.h"
+#include "loader/Win32DisplayInfo.h"
 
 #define LOG_TAG "HyperPlay.GpuD3D9"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -40,7 +50,7 @@ namespace {
     X(vkCreateDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets)   \
     X(vkCreateCommandPool) X(vkAllocateCommandBuffers) X(vkResetCommandBuffer) X(vkBeginCommandBuffer)         \
     X(vkEndCommandBuffer) X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkCmdPipelineBarrier)         \
-    X(vkCmdCopyBufferToImage) X(vkCmdBlitImage) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)                  \
+    X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdBlitImage) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) \
     X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer)          \
     X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetBlendConstants)          \
     X(vkCmdSetDepthBias) X(vkCmdSetStencilReference) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage)    \
@@ -141,6 +151,24 @@ struct RingAlloc {
     uint8_t* ptr = nullptr;
 };
 
+struct DescKey {
+    uint64_t b0 = 0, b1 = 0;
+    uint64_t imgs[20 * 2]{};
+    bool operator==(const DescKey& o) const {
+        return b0 == o.b0 && b1 == o.b1 && std::memcmp(imgs, o.imgs, sizeof(imgs)) == 0;
+    }
+};
+struct DescKeyHash {
+    size_t operator()(const DescKey& k) const {
+        uint64_t h = 0xCBF29CE484222325ull;
+        auto m = [&](uint64_t v) { h = (h ^ v) * 0x100000001B3ull; };
+        m(k.b0);
+        m(k.b1);
+        for (uint64_t v : k.imgs) m(v);
+        return static_cast<size_t>(h ^ (h >> 32));
+    }
+};
+
 struct Frame {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
@@ -149,6 +177,38 @@ struct Frame {
     std::vector<RingChunk> chunks;
     size_t chunkIndex = 0;
     std::unordered_map<uint64_t, RingAlloc> bufferCache;
+    std::unordered_map<uint64_t, VkDescriptorBufferInfo> uboCache;
+    std::unordered_map<DescKey, VkDescriptorSet, DescKeyHash> descCache;
+    VkPipeline lastPipeline = VK_NULL_HANDLE;
+    VkDescriptorSet lastSet = VK_NULL_HANDLE;
+    uint32_t lastDyn0 = ~0u, lastDyn1 = ~0u;
+    bool hasDynState = false;
+    VkViewport lastVp{};
+    VkRect2D lastSc{};
+    uint32_t lastBlend = 0;
+    uint32_t lastStencil = 0;
+    uint32_t lastBias195 = 0, lastSlope175 = 0;
+    float lastUnits = 0.0f;
+    VkBuffer lastVbuf[17] = {};
+    VkDeviceSize lastVoff[17] = {};
+    VkBuffer lastIbuf = VK_NULL_HANDLE;
+    VkDeviceSize lastIoff = 0;
+    VkIndexType lastItype = VK_INDEX_TYPE_UINT16;
+    bool hasTargets = false;
+    bool lastTargetSrgb = false;
+    const void* lastTargetKey[4] = {};
+    uint32_t lastTargetLevel[4] = {};
+    uint32_t lastTargetFace[4] = {};
+    const void* lastDepthKey = nullptr;
+    struct CachedTargets {
+        void* color[4] = {};
+        VkImageView colorView[4] = {};
+        VkFormat colorFmt[4] = {};
+        uint32_t nColor = 0;
+        void* depth = nullptr;
+        VkImageView depthView = VK_NULL_HANDLE;
+        uint32_t w = 0, h = 0;
+    } cachedTargets;
 };
 
 struct GpuImage {
@@ -158,11 +218,18 @@ struct GpuImage {
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t d3dFormat = 0;
     uint32_t width = 1, height = 1, depth = 1, mips = 1, layers = 1;
-    bool cube = false, is3D = false, attachable = false, decompressed = false;
+    bool cube = false, is3D = false, attachable = false, decompressed = false, everSampled = false;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     uint64_t uploadedGen = ~0ull;
     std::map<uint64_t, VkImageView> views;
+    VkImageView sampleView[2] = {};
+    bool pendingColorClear = false;
+    VkClearColorValue pendingColor{};
+    bool pendingDepthClear = false;
+    VkImageAspectFlags pendingDepthAsp = 0;
+    VkClearDepthStencilValue pendingDepth{};
+    uint32_t pendingMip = 0, pendingLayer = 0;
 };
 
 struct GpuBuffer {
@@ -280,26 +347,30 @@ public:
     std::array<Frame, 2> frames;
     size_t slot = 0;
     bool recording = false;
+    uint64_t statFenceNs = 0, statPresentNs = 0, statFrameNs = 0, statDrawNs = 0, statWorkerNs = 0;
+    uint64_t statPasses = 0, statLoadPasses = 0, statDepthPasses = 0;
+    int64_t lastPresentNs = 0;
     Renderer::Stats stats;
 
     std::unordered_map<const void*, std::unique_ptr<GpuImage>> images;
     std::unordered_map<const void*, GpuBuffer> buffers;
-    std::unordered_map<const void*, ShaderEntry> shaders;
+    std::unordered_map<uint64_t, ShaderEntry> shaders;
     std::unordered_map<uint64_t, VkPipeline> pipelines;
     std::unordered_map<uint64_t, VkSampler> samplers;
-    std::map<std::vector<uint64_t>, VkRenderPass> renderPasses;
-    std::map<std::vector<uint64_t>, VkFramebuffer> framebuffers;
+    std::map<std::array<uint64_t, 6>, VkRenderPass> renderPasses;
+    std::map<std::array<uint64_t, 6>, VkFramebuffer> framebuffers;
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
     VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
 
     GpuImage dummy2D, dummyCube, dummy3D;
+    VkImageView dummy2DView = VK_NULL_HANDLE, dummyCubeView = VK_NULL_HANDLE, dummy3DView = VK_NULL_HANDLE;
     VkSampler defaultSampler = VK_NULL_HANDLE, presentSampler = VK_NULL_HANDLE;
     VkBuffer zeroBuffer = VK_NULL_HANDLE;
     VkDeviceMemory zeroMemory = VK_NULL_HANDLE;
 
     // Render pass abierto.
     bool passOpen = false;
-    std::vector<uint64_t> passKey;
+    std::array<uint64_t, 6> passKey{};
     VkRenderPass passRp = VK_NULL_HANDLE;
     uint32_t passW = 0, passH = 0;
     GpuImage* passColor[4] = {};
@@ -311,6 +382,8 @@ public:
     VkPipeline presentPipeline = VK_NULL_HANDLE;
     VkPipelineLayout presentLayout = VK_NULL_HANDLE;
     VkDescriptorSetLayout presentSetLayout = VK_NULL_HANDLE;
+    VkPipeline sgsrPipeline = VK_NULL_HANDLE;
+    VkPipelineLayout sgsrLayout = VK_NULL_HANDLE;
     uint64_t presentGeneration = ~0ull;
     std::map<VkImageView, VkFramebuffer> presentFbs;
 
@@ -369,8 +442,8 @@ public:
 
     bool createLayouts() {
         std::vector<VkDescriptorSetLayoutBinding> b;
-        b.push_back({0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr});
-        b.push_back({1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr});
+        b.push_back({0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr});
+        b.push_back({1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr});
         for (uint32_t i = 0; i < kSamplerBindings; ++i)
             b.push_back({2 + i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                          static_cast<VkShaderStageFlags>(i < 16 ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT),
@@ -391,7 +464,9 @@ public:
             if ((bits & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & want) == want) return i;
         return UINT32_MAX;
     }
-    bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buf, VkDeviceMemory& mem, uint8_t** mapped) {
+    bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buf, VkDeviceMemory& mem, uint8_t** mapped,
+                      VkMemoryPropertyFlags memFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) {
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bi.size = size;
         bi.usage = usage;
@@ -401,13 +476,18 @@ public:
         f.vkGetBufferMemoryRequirements(ctx.device, buf, &req);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         ai.allocationSize = req.size;
-        ai.memoryTypeIndex = memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        ai.memoryTypeIndex = memoryType(req.memoryTypeBits, memFlags);
+        if (ai.memoryTypeIndex == UINT32_MAX)
+            ai.memoryTypeIndex = memoryType(req.memoryTypeBits,
+                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         if (ai.memoryTypeIndex == UINT32_MAX) return false;
         if (f.vkAllocateMemory(ctx.device, &ai, nullptr, &mem) != VK_SUCCESS) return false;
         f.vkBindBufferMemory(ctx.device, buf, mem, 0);
-        void* p = nullptr;
-        if (f.vkMapMemory(ctx.device, mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) return false;
-        if (mapped != nullptr) *mapped = static_cast<uint8_t*>(p);
+        if (mapped != nullptr) {
+            void* p = nullptr;
+            if (f.vkMapMemory(ctx.device, mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) return false;
+            *mapped = static_cast<uint8_t*>(p);
+        }
         return true;
     }
 
@@ -497,6 +577,10 @@ public:
     // Vista: tipo, sRGB, rango (nivel/capa). Para muestrear se aplica el swizzle del formato D3D9.
     VkImageView view(GpuImage& g, VkImageViewType type, bool srgb, uint32_t baseMip, uint32_t mipCount, uint32_t baseLayer,
                      uint32_t layerCount, bool forSampling) {
+        const bool fastSample = forSampling && baseMip == 0 && mipCount == g.mips && baseLayer == 0 &&
+                                !g.is3D && ((type == VK_IMAGE_VIEW_TYPE_CUBE && g.cube) ||
+                                            (type != VK_IMAGE_VIEW_TYPE_CUBE && !g.cube));
+        if (fastSample && g.sampleView[srgb ? 1 : 0] != VK_NULL_HANDLE) return g.sampleView[srgb ? 1 : 0];
         baseMip = std::min(baseMip, g.mips - 1);
         mipCount = std::min(mipCount, g.mips - baseMip);
         baseLayer = std::min(baseLayer, g.layers - 1);
@@ -509,7 +593,10 @@ public:
                                          baseMip * 64 + mipCount), baseLayer * 4096 + layerCount),
                                  forSampling ? 1 : 0);
         auto it = g.views.find(key);
-        if (it != g.views.end()) return it->second;
+        if (it != g.views.end()) {
+            if (fastSample) g.sampleView[srgb ? 1 : 0] = it->second;
+            return it->second;
+        }
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = g.image;
         vi.viewType = type;
@@ -520,6 +607,7 @@ public:
         VkImageView v = VK_NULL_HANDLE;
         if (f.vkCreateImageView(ctx.device, &vi, nullptr, &v) != VK_SUCCESS) return VK_NULL_HANDLE;
         g.views[key] = v;
+        if (fastSample) g.sampleView[srgb ? 1 : 0] = v;
         return v;
     }
 
@@ -530,19 +618,81 @@ public:
         return g.fmt.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     }
 
+    void flushPendingClear(GpuImage& g) {
+        if (g.pendingColorClear) {
+            g.pendingColorClear = false;
+            barrier(g, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, g.pendingMip, 1, g.pendingLayer, 1};
+            f.vkCmdClearColorImage(frames[slot].cmd, g.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &g.pendingColor, 1, &rng);
+        }
+        if (g.pendingDepthClear) {
+            g.pendingDepthClear = false;
+            const VkImageAspectFlags asp = g.pendingDepthAsp;
+            barrier(g, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkImageSubresourceRange rng{asp, g.pendingMip, 1, g.pendingLayer, 1};
+            f.vkCmdClearDepthStencilImage(frames[slot].cmd, g.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &g.pendingDepth, 1, &rng);
+        }
+    }
+
     void barrier(GpuImage& g, VkImageLayout to) {
+        if (to != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL && to != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL &&
+            to != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && (g.pendingColorClear || g.pendingDepthClear)) {
+            flushPendingClear(g);
+        }
         if (g.layout == to) return;
         endPass();
+        auto srcInfo = [](VkImageLayout l) -> std::pair<VkPipelineStageFlags, VkAccessFlags> {
+            switch (l) {
+                case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+                    return {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+                case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+                    return {VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+                case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+                    return {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+                case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+                    return {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+                case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+                    return {VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0};
+                case VK_IMAGE_LAYOUT_GENERAL:
+                    return {VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+                default:
+                    return {VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0};
+            }
+        };
+        auto dstInfo = [](VkImageLayout l) -> std::pair<VkPipelineStageFlags, VkAccessFlags> {
+            switch (l) {
+                case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+                    return {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+                case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+                    return {VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+                case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+                    return {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+                case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+                    return {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+                case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+                    return {VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                            VK_ACCESS_SHADER_READ_BIT};
+                case VK_IMAGE_LAYOUT_GENERAL:
+                    return {VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+                default:
+                    return {VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0};
+            }
+        };
+        const auto [srcStage, srcAccess] = srcInfo(g.layout);
+        const auto [dstStage, dstAccess] = dstInfo(to);
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        b.srcAccessMask = srcAccess;
+        b.dstAccessMask = dstAccess;
         b.oldLayout = g.layout;
         b.newLayout = to;
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image = g.image;
         b.subresourceRange = {g.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-        f.vkCmdPipelineBarrier(frames[slot].cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
-                               nullptr, 0, nullptr, 1, &b);
+        f.vkCmdPipelineBarrier(frames[slot].cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
         g.layout = to;
     }
 
@@ -621,6 +771,8 @@ public:
             g.cube = t.kind == 1;
             g.layers = g.cube ? 6 : 1;
             g.attachable = wantAttach && fmt.blockW == 1 && !decompress;
+            if (t.format == 0x5A544E49u || t.format == 0x34324644u || t.format == 0x36314644u)
+                g.everSampled = true;  // INTZ / DF24 / DF16: profundidad muestreada
             if (!createImage(g)) {
                 LOGW("vkCreateImage %ux%u fmt 0x%x falló", g.width, g.height, t.format);
                 slotPtr.reset();
@@ -707,13 +859,27 @@ public:
     bool beginFrame() {
         if (recording) return true;
         Frame& fr = frames[slot];
+        timespec t0{}, t1{};
+        clock_gettime(CLOCK_MONOTONIC, &t0);
         f.vkWaitForFences(ctx.device, 1, &fr.fence, VK_TRUE, 2000000000ull);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        statFenceNs += static_cast<uint64_t>((t1.tv_sec - t0.tv_sec) * 1000000000LL + (t1.tv_nsec - t0.tv_nsec));
         f.vkResetFences(ctx.device, 1, &fr.fence);
         for (VkDescriptorPool p : fr.pools) f.vkResetDescriptorPool(ctx.device, p, 0);
         fr.poolIndex = 0;
         for (RingChunk& c : fr.chunks) c.used = 0;
         fr.chunkIndex = 0;
         fr.bufferCache.clear();
+        fr.uboCache.clear();
+        fr.descCache.clear();
+        fr.lastPipeline = VK_NULL_HANDLE;
+        fr.lastSet = VK_NULL_HANDLE;
+        fr.lastDyn0 = ~0u;
+        fr.lastDyn1 = ~0u;
+        fr.hasDynState = false;
+        fr.hasTargets = false;
+        std::memset(fr.lastVbuf, 0, sizeof(fr.lastVbuf));
+        fr.lastIbuf = VK_NULL_HANDLE;
         f.vkResetCommandBuffer(fr.cmd, 0);
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -728,7 +894,7 @@ public:
         for (;;) {
             if (fr.poolIndex >= fr.pools.size()) {
                 const VkDescriptorPoolSize sizes[] = {
-                    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096},
+                    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4096},
                     {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2048 * kSamplerBindings},
                 };
                 VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -750,10 +916,13 @@ public:
     }
 
     // ----------------------------------------------------------------------- render passes
-    VkRenderPass renderPass(const VkFormat* colors, uint32_t nColor, VkFormat depth) {
-        std::vector<uint64_t> key;
-        for (uint32_t i = 0; i < nColor; ++i) key.push_back(static_cast<uint64_t>(colors[i]));
-        key.push_back(static_cast<uint64_t>(depth) | (1ull << 40));
+    VkRenderPass renderPass(const VkFormat* colors, uint32_t nColor, VkFormat depth, uint32_t clearMask = 0,
+                            bool depthStore = true, uint32_t dontCareMask = 0) {
+        std::array<uint64_t, 6> key{};
+        for (uint32_t i = 0; i < nColor; ++i) key[i] = static_cast<uint64_t>(colors[i]);
+        key[4] = static_cast<uint64_t>(depth) | (1ull << 40);
+        key[5] = static_cast<uint64_t>(clearMask) | (static_cast<uint64_t>(nColor) << 16) |
+                 (depthStore ? (1ull << 24) : 0ull) | (static_cast<uint64_t>(dontCareMask) << 25);
         auto it = renderPasses.find(key);
         if (it != renderPasses.end()) return it->second;
         std::vector<VkAttachmentDescription> att;
@@ -762,7 +931,9 @@ public:
             VkAttachmentDescription a{};
             a.format = colors[i];
             a.samples = VK_SAMPLE_COUNT_1_BIT;
-            a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            a.loadOp = (clearMask & (1u << i)) ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                     : (dontCareMask & (1u << i)) ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                                                  : VK_ATTACHMENT_LOAD_OP_LOAD;
             a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
             a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -775,8 +946,9 @@ public:
             VkAttachmentDescription a{};
             a.format = depth;
             a.samples = VK_SAMPLE_COUNT_1_BIT;
-            a.loadOp = a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-            a.storeOp = a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+            a.loadOp = (clearMask & (1u << 4)) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+            a.stencilLoadOp = (clearMask & (1u << 5)) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+            a.storeOp = a.stencilStoreOp = depthStore ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
             a.initialLayout = a.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             att.push_back(a);
         }
@@ -800,7 +972,7 @@ public:
         if (!passOpen) return;
         f.vkCmdEndRenderPass(frames[slot].cmd);
         passOpen = false;
-        passKey.clear();
+        passKey = {};
     }
 
     struct Targets {
@@ -815,6 +987,24 @@ public:
 
     bool resolveTargets(const DrawState& s, Targets& t) {
         const bool srgb = s.renderState != nullptr && s.renderState[194] != 0;
+        Frame& fr = frames[slot];
+        if (fr.hasTargets && fr.lastTargetSrgb == srgb && fr.lastDepthKey == s.depth.key &&
+            fr.lastTargetKey[0] == s.targets[0].key && fr.lastTargetLevel[0] == s.targets[0].level && fr.lastTargetFace[0] == s.targets[0].face &&
+            fr.lastTargetKey[1] == s.targets[1].key && fr.lastTargetLevel[1] == s.targets[1].level && fr.lastTargetFace[1] == s.targets[1].face &&
+            fr.lastTargetKey[2] == s.targets[2].key && fr.lastTargetLevel[2] == s.targets[2].level && fr.lastTargetFace[2] == s.targets[2].face &&
+            fr.lastTargetKey[3] == s.targets[3].key && fr.lastTargetLevel[3] == s.targets[3].level && fr.lastTargetFace[3] == s.targets[3].face) {
+            t.nColor = fr.cachedTargets.nColor;
+            for (uint32_t i = 0; i < t.nColor; ++i) {
+                t.color[i] = static_cast<GpuImage*>(fr.cachedTargets.color[i]);
+                t.colorView[i] = fr.cachedTargets.colorView[i];
+                t.colorFmt[i] = fr.cachedTargets.colorFmt[i];
+            }
+            t.depth = static_cast<GpuImage*>(fr.cachedTargets.depth);
+            t.depthView = fr.cachedTargets.depthView;
+            t.w = fr.cachedTargets.w;
+            t.h = fr.cachedTargets.h;
+            return t.nColor > 0 || t.depth != nullptr;
+        }
         for (uint32_t i = 0; i < 4; ++i) {
             if (!s.targets[i].valid()) continue;
             if (s.targets[i].format == fourcc('N', 'U', 'L', 'L')) continue;
@@ -839,33 +1029,72 @@ public:
                 t.h = t.h == 0 ? g->height : std::min(t.h, g->height);
             }
         }
+        fr.hasTargets = true;
+        fr.lastTargetSrgb = srgb;
+        fr.lastDepthKey = s.depth.key;
+        for (uint32_t i = 0; i < 4; ++i) {
+            fr.lastTargetKey[i] = s.targets[i].key;
+            fr.lastTargetLevel[i] = s.targets[i].level;
+            fr.lastTargetFace[i] = s.targets[i].face;
+            fr.cachedTargets.color[i] = t.color[i];
+            fr.cachedTargets.colorView[i] = t.colorView[i];
+            fr.cachedTargets.colorFmt[i] = t.colorFmt[i];
+        }
+        fr.cachedTargets.nColor = t.nColor;
+        fr.cachedTargets.depth = t.depth;
+        fr.cachedTargets.depthView = t.depthView;
+        fr.cachedTargets.w = t.w;
+        fr.cachedTargets.h = t.h;
         return t.nColor > 0 || t.depth != nullptr;
     }
 
-    VkRenderPass beginPass(const Targets& t) {
-        std::vector<uint64_t> key;
-        for (uint32_t i = 0; i < t.nColor; ++i) key.push_back(reinterpret_cast<uint64_t>(t.colorView[i]));
-        key.push_back(reinterpret_cast<uint64_t>(t.depthView));
-        key.push_back((static_cast<uint64_t>(t.w) << 32) | t.h);
-        if (passOpen && key == passKey) return passRp;
+    VkRenderPass beginPass(const Targets& t, uint32_t dontCareMask = 0) {
+        std::array<uint64_t, 6> fbKey{};
+        for (uint32_t i = 0; i < t.nColor; ++i) fbKey[i] = reinterpret_cast<uint64_t>(t.colorView[i]);
+        fbKey[4] = reinterpret_cast<uint64_t>(t.depthView);
+        fbKey[5] = (static_cast<uint64_t>(t.w) << 32) | t.h;
+        if (passOpen && fbKey == passKey) return passRp;
         endPass();
-        for (uint32_t i = 0; i < t.nColor; ++i) barrier(*t.color[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        if (t.depth != nullptr) barrier(*t.depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-        const VkRenderPass rp = renderPass(t.colorFmt, t.nColor, t.depth != nullptr ? t.depth->format : VK_FORMAT_UNDEFINED);
+        uint32_t clearMask = 0;
+        VkClearValue clearVals[5]{};
+        for (uint32_t i = 0; i < t.nColor; ++i) {
+            if (t.color[i]->pendingColorClear) {
+                clearMask |= (1u << i);
+                clearVals[i].color = t.color[i]->pendingColor;
+                t.color[i]->pendingColorClear = false;
+            }
+            barrier(*t.color[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        }
+        dontCareMask &= ~clearMask;
+        if (t.depth != nullptr) {
+            if (t.depth->pendingDepthClear) {
+                if (t.depth->pendingDepthAsp & VK_IMAGE_ASPECT_DEPTH_BIT) clearMask |= (1u << 4);
+                if (t.depth->pendingDepthAsp & VK_IMAGE_ASPECT_STENCIL_BIT) clearMask |= (1u << 5);
+                clearVals[t.nColor].depthStencil = t.depth->pendingDepth;
+                t.depth->pendingDepthClear = false;
+                t.depth->pendingDepthAsp = 0;
+            }
+            barrier(*t.depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        }
+        const bool depthStore = true;  // UE3/D3D9 reutiliza depth/stencil entre múltiples pases sin muestrear
+        const VkRenderPass rp = renderPass(t.colorFmt, t.nColor, t.depth != nullptr ? t.depth->format : VK_FORMAT_UNDEFINED,
+                                           clearMask, depthStore, dontCareMask);
         if (rp == VK_NULL_HANDLE) return VK_NULL_HANDLE;
-        VkFramebuffer& fb = framebuffers[key];
+        VkFramebuffer& fb = framebuffers[fbKey];
         if (fb == VK_NULL_HANDLE) {
-            std::vector<VkImageView> views(t.colorView, t.colorView + t.nColor);
-            if (t.depth != nullptr) views.push_back(t.depthView);
+            VkImageView views[5]{};
+            for (uint32_t i = 0; i < t.nColor; ++i) views[i] = t.colorView[i];
+            uint32_t nViews = t.nColor;
+            if (t.depth != nullptr) views[nViews++] = t.depthView;
             VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-            fi.renderPass = rp;
-            fi.attachmentCount = static_cast<uint32_t>(views.size());
-            fi.pAttachments = views.data();
+            fi.renderPass = renderPass(t.colorFmt, t.nColor, t.depth != nullptr ? t.depth->format : VK_FORMAT_UNDEFINED, 0);
+            fi.attachmentCount = nViews;
+            fi.pAttachments = views;
             fi.width = t.w;
             fi.height = t.h;
             fi.layers = 1;
             if (f.vkCreateFramebuffer(ctx.device, &fi, nullptr, &fb) != VK_SUCCESS) {
-                framebuffers.erase(key);
+                framebuffers.erase(fbKey);
                 return VK_NULL_HANDLE;
             }
         }
@@ -873,9 +1102,14 @@ public:
         bi.renderPass = rp;
         bi.framebuffer = fb;
         bi.renderArea = {{0, 0}, {t.w, t.h}};
+        bi.clearValueCount = clearMask != 0 ? (t.nColor + (t.depth != nullptr ? 1u : 0u)) : 0u;
+        bi.pClearValues = clearMask != 0 ? clearVals : nullptr;
         f.vkCmdBeginRenderPass(frames[slot].cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+        ++statPasses;
+        if (clearMask == 0) ++statLoadPasses;
+        if (t.depth != nullptr) ++statDepthPasses;
         passOpen = true;
-        passKey = key;
+        passKey = fbKey;
         passRp = rp;
         passW = t.w;
         passH = t.h;
@@ -891,14 +1125,15 @@ public:
         return f.vkCreateShaderModule(ctx.device, &si, nullptr, &m) == VK_SUCCESS ? m : VK_NULL_HANDLE;
     }
 
-    ShaderEntry* shader(const void* key, const uint32_t* tok, size_t n) {
+    ShaderEntry* shader(const void* key, const uint32_t* tok, size_t n, bool alphaTest = true) {
         if (key == nullptr || tok == nullptr) return nullptr;
-        auto it = shaders.find(key);
+        const uint64_t skey = reinterpret_cast<uintptr_t>(key) ^ (alphaTest ? 1ull : 0ull);
+        auto it = shaders.find(skey);
         if (it != shaders.end()) return it->second.failed ? nullptr : &it->second;
-        ShaderEntry& e = shaders[key];
+        ShaderEntry& e = shaders[skey];
         std::vector<uint32_t> spv;
         std::string err;
-        if (!d3d9sh::translate(tok, n, spv, e.info, err)) {
+        if (!d3d9sh::translate(tok, n, spv, e.info, err, alphaTest)) {
             e.failed = true;
             LOGW("Shader D3D9 %p no traducido: %s", key, err.c_str());
             return nullptr;
@@ -912,12 +1147,19 @@ public:
         return &e;
     }
 
+    uint64_t lastSamplerKey = ~0ull;
+    VkSampler lastSamplerVal = VK_NULL_HANDLE;
     VkSampler sampler(const uint32_t* ss) {
         // ss: [1] ADDRESSU [2] V [3] W [4] BORDERCOLOR [5] MAG [6] MIN [7] MIP [8] LODBIAS [9] MAXMIPLEVEL [10] ANISO
         uint64_t key = 0;
         for (int i = 1; i <= 10; ++i) key = mix(key, ss[i]);
+        if (key == lastSamplerKey && lastSamplerVal != VK_NULL_HANDLE) return lastSamplerVal;
         auto it = samplers.find(key);
-        if (it != samplers.end()) return it->second;
+        if (it != samplers.end()) {
+            lastSamplerKey = key;
+            lastSamplerVal = it->second;
+            return it->second;
+        }
         VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.magFilter = ss[5] >= 2 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
         si.minFilter = ss[6] >= 2 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
@@ -951,25 +1193,31 @@ public:
         uint32_t streamMask = 0;
         bool needZero = false;
     };
+    VertexLayout tmpVl_;
 
     bool vertexLayout(const DrawState& s, const d3d9sh::ShaderInfo& vsi, VertexLayout& out) {
+        out.bindings.clear();
+        out.attrs.clear();
+        out.streamMask = 0;
+        out.needZero = false;
         struct Elem { uint16_t stream, offset; uint8_t type, method, usage, index; };
-        std::vector<Elem> elems;
+        Elem elems[64];
+        uint32_t nElems = 0;
         if (s.decl != nullptr) {
             for (uint32_t i = 0; i < 64; ++i) {
                 Elem e;
                 std::memcpy(&e, s.decl + 8 * i, 8);
                 if (e.stream == 0xFF || e.type == 17) break;
-                elems.push_back(e);
+                elems[nElems++] = e;
             }
         }
         for (const auto& in : vsi.inputs) {
             const Elem* found = nullptr;
-            for (const Elem& e : elems)
-                if (e.usage == in.usage && e.index == in.index) { found = &e; break; }
+            for (uint32_t ei = 0; ei < nElems; ++ei)
+                if (elems[ei].usage == in.usage && elems[ei].index == in.index) { found = &elems[ei]; break; }
             if (found == nullptr && in.usage == 0)  // POSITION <-> POSITIONT
-                for (const Elem& e : elems)
-                    if (e.usage == 9 && e.index == in.index) { found = &e; break; }
+                for (uint32_t ei = 0; ei < nElems; ++ei)
+                    if (elems[ei].usage == 9 && elems[ei].index == in.index) { found = &elems[ei]; break; }
             VkVertexInputAttributeDescription a{};
             a.location = in.reg;
             if (found == nullptr || found->stream >= 16 || vertexFormat(found->type) == VK_FORMAT_UNDEFINED) {
@@ -1120,13 +1368,33 @@ public:
             GpuBuffer& b = buffers[st.key];
             if (b.buffer == VK_NULL_HANDLE || b.size < st.size) {
                 if (b.buffer != VK_NULL_HANDLE) return ringBuffer(st, buf, off);  // crecer: no se libera en vuelo
-                if (!createBuffer(st.size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, b.buffer,
-                                  b.memory, &b.ptr))
+                if (!createBuffer(st.size,
+                                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                  b.buffer, b.memory, nullptr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
                     return false;
                 b.size = st.size;
             }
             if (b.gen != st.generation) {
-                std::memcpy(b.ptr, st.data, st.size);
+                // Subida a mitad de pase: no romper el VkRenderPass (UE3 hace Lock/Unlock de VB/IB
+                // estáticos entre draws). Este draw lee del anillo host-visible; la copia al búfer
+                // device-local se hace en el siguiente bind fuera de pase (b.gen no se actualiza).
+                if (passOpen && st.size <= (4ull << 20)) return ringBuffer(st, buf, off);
+                RingAlloc a = ringAlloc(st.size, 16);
+                if (a.ptr == nullptr) return false;
+                std::memcpy(a.ptr, st.data, st.size);
+                endPass();
+                VkBufferCopy cp{a.offset, 0, st.size};
+                f.vkCmdCopyBuffer(frames[slot].cmd, a.buffer, b.buffer, 1, &cp);
+                VkBufferMemoryBarrier mb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+                mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                mb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
+                mb.srcQueueFamilyIndex = mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                mb.buffer = b.buffer;
+                mb.offset = 0;
+                mb.size = st.size;
+                f.vkCmdPipelineBarrier(frames[slot].cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+                                       0, 0, nullptr, 1, &mb, 0, nullptr);
                 b.gen = st.generation;
             }
             buf = b.buffer;
@@ -1153,37 +1421,76 @@ public:
 
     // Bloque uniforme de una etapa: {c[256], i[16], b[16], alphaTest}.
     bool uniforms(const DrawState& s, bool vs, const d3d9sh::ShaderInfo& info, VkDescriptorBufferInfo& out) {
+        Frame& fr = frames[slot];
+        const uint64_t gen = vs ? s.vsConstGen : s.psConstGen;
+        const uint64_t atKey = (!vs && s.renderState != nullptr && s.renderState[15] != 0)
+                                   ? (1ull | (static_cast<uint64_t>(s.renderState[25] & 0xFFu) << 1) |
+                                      (static_cast<uint64_t>(s.renderState[24] & 0xFFu) << 9))
+                                   : 0ull;
+        const uint64_t uboKey = (gen != 0 && !info.relativeConst)
+                                    ? (vs ? (gen << 1) : mix((gen << 1) | 1ull, atKey))
+                                    : 0ull;
+        if (uboKey != 0) {
+            if (auto it = fr.uboCache.find(uboKey); it != fr.uboCache.end()) {
+                out = it->second;
+                return true;
+            }
+        }
         RingAlloc a = ringAlloc(kUboSize, uboAlign);
         if (a.ptr == nullptr) return false;
-        std::memset(a.ptr, 0, kUboSize);
         const float* fsrc = vs ? s.vsF : s.psF;
-        if (fsrc != nullptr) std::memcpy(a.ptr, fsrc, (vs ? 256 : 224) * 16);
+        const uint32_t maxRegs = info.relativeConst ? (vs ? 256u : 224u)
+                                                    : std::min<uint32_t>(info.maxFloatConst, vs ? 256u : 224u);
+        if (maxRegs > 0) {
+            const size_t fbytes = static_cast<size_t>(maxRegs) * 16u;
+            if (fsrc != nullptr) {
+                std::memcpy(a.ptr, fsrc, fbytes);
+            } else {
+                std::memset(a.ptr, 0, fbytes);
+            }
+        }
         if (info.relativeConst)
             for (const auto& d : info.floatDefs)
                 if (d.reg < 256) std::memcpy(a.ptr + d.reg * 16, d.v, 16);
-        const int32_t* isrc = vs ? s.vsI : s.psI;
-        if (isrc != nullptr) std::memcpy(a.ptr + 4096, isrc, 256);
-        const uint32_t* bsrc = vs ? s.vsB : s.psB;
-        if (bsrc != nullptr)
-            for (int i = 0; i < 16; ++i) std::memcpy(a.ptr + 4096 + 256 + 16 * i, &bsrc[i], 4);
+        if (info.usesIntConst) {
+            const int32_t* isrc = vs ? s.vsI : s.psI;
+            if (isrc != nullptr) std::memcpy(a.ptr + 4096, isrc, 256);
+            else std::memset(a.ptr + 4096, 0, 256);
+        }
+        if (info.usesBoolConst) {
+            const uint32_t* bsrc = vs ? s.vsB : s.psB;
+            if (bsrc != nullptr) {
+                for (int i = 0; i < 16; ++i) {
+                    const uint32_t row[4] = {bsrc[i], 0, 0, 0};
+                    std::memcpy(a.ptr + 4096 + 256 + 16 * i, row, 16);
+                }
+            } else {
+                std::memset(a.ptr + 4096 + 256, 0, 256);
+            }
+        }
         if (!vs) {
             const float at[4] = {s.renderState[15] != 0 ? static_cast<float>(s.renderState[25]) : 8.0f,
                                  static_cast<float>(s.renderState[24] & 0xFF) / 255.0f, 0, 0};
             std::memcpy(a.ptr + 4096 + 512, at, 16);
         }
         out = {a.buffer, a.offset, kUboSize};
+        if (uboKey != 0) fr.uboCache[uboKey] = out;
         return true;
     }
 
     // ----------------------------------------------------------------------- draw
     void setViewportScissor(const DrawState& s, const Targets& t) {
-        VkCommandBuffer cmd = frames[slot].cmd;
+        Frame& fr = frames[slot];
+        VkCommandBuffer cmd = fr.cmd;
         float x = static_cast<float>(s.viewport[0]), y = static_cast<float>(s.viewport[1]);
         float w = static_cast<float>(s.viewport[2]), h = static_cast<float>(s.viewport[3]);
         if (w <= 0 || h <= 0) { x = 0; y = 0; w = static_cast<float>(t.w); h = static_cast<float>(t.h); }
         // Eje Y de D3D (arriba) con altura negativa y centro de píxel de D3D9 (+0.5).
         VkViewport vp{x + 0.5f, y + h + 0.5f, w, -h, s.minZ, s.maxZ};
-        f.vkCmdSetViewport(cmd, 0, 1, &vp);
+        if (!fr.hasDynState || std::memcmp(&vp, &fr.lastVp, sizeof(vp)) != 0) {
+            f.vkCmdSetViewport(cmd, 0, 1, &vp);
+            fr.lastVp = vp;
+        }
         int32_t l = 0, tp = 0, rr = static_cast<int32_t>(t.w), bb = static_cast<int32_t>(t.h);
         if (s.renderState[174] != 0) {
             l = std::max(l, s.scissor[0]);
@@ -1192,7 +1499,10 @@ public:
             bb = std::min(bb, s.scissor[3]);
         }
         VkRect2D sc{{l, tp}, {static_cast<uint32_t>(std::max(0, rr - l)), static_cast<uint32_t>(std::max(0, bb - tp))}};
-        f.vkCmdSetScissor(cmd, 0, 1, &sc);
+        if (!fr.hasDynState || std::memcmp(&sc, &fr.lastSc, sizeof(sc)) != 0) {
+            f.vkCmdSetScissor(cmd, 0, 1, &sc);
+            fr.lastSc = sc;
+        }
     }
 
     bool draw(const DrawState& s, uint32_t prim, uint32_t primCount, bool indexed, int32_t baseVertex, uint32_t first,
@@ -1201,21 +1511,28 @@ public:
         const uint32_t count = vertexCount(prim, primCount);
         if (count == 0) return true;
         ShaderEntry* vs = shader(s.vsKey, s.vsTokens, s.vsCount);
-        ShaderEntry* ps = shader(s.psKey, s.psTokens, s.psCount);
+        const bool atEnable = s.renderState[15] != 0;
+        ShaderEntry* ps = shader(s.psKey, s.psTokens, s.psCount, atEnable);
         if (vs == nullptr || ps == nullptr) {  // sin shaders (función fija) o no traducibles
             ++stats.failedDraws;
             return false;
         }
+        if (dummy2DView == VK_NULL_HANDLE) {
+            dummy2DView = view(dummy2D, VK_IMAGE_VIEW_TYPE_2D, false, 0, 1, 0, 1, true);
+            dummyCubeView = view(dummyCube, VK_IMAGE_VIEW_TYPE_CUBE, false, 0, 1, 0, 1, true);
+            dummy3DView = view(dummy3D, VK_IMAGE_VIEW_TYPE_3D, false, 0, 1, 0, 1, true);
+        }
         // Texturas antes del pase (las subidas y barreras lo cerrarían).
         VkDescriptorImageInfo img[kSamplerBindings];
+        GpuImage* boundImg[kSamplerBindings] = {};
         for (uint32_t i = 0; i < kSamplerBindings; ++i) {
             const bool vsSlot = i >= 16;
             const d3d9sh::ShaderInfo& info = vsSlot ? vs->info : ps->info;
             const uint32_t sn = vsSlot ? i - 16 : i;
             const uint32_t type = (info.samplerMask & (1u << sn)) ? info.samplerType[sn] : 2;
-            GpuImage* dummy = type == 3 ? &dummyCube : type == 4 ? &dummy3D : &dummy2D;
+            const VkImageView dview = type == 3 ? dummyCubeView : type == 4 ? dummy3DView : dummy2DView;
             const VkImageViewType vt = type == 3 ? VK_IMAGE_VIEW_TYPE_CUBE : type == 4 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
-            img[i] = {defaultSampler, view(*dummy, vt, false, 0, 1, 0, 1, true), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            img[i] = {defaultSampler, dview, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             if (!(info.samplerMask & (1u << sn))) continue;
             GpuImage* g = image(s.textures[i], false);
             if (g == nullptr) continue;
@@ -1226,15 +1543,18 @@ public:
             const VkImageView v = view(*g, vt, ss[11] != 0, 0, g->mips, 0, g->layers, true);
             if (v == VK_NULL_HANDLE) continue;
             img[i] = {sampler(ss), v, readLayout(*g)};
+            boundImg[i] = g;
+            if (g->fmt.depth) g->everSampled = true;
         }
-        VertexLayout vl;
+        VertexLayout& vl = tmpVl_;
         vertexLayout(s, vs->info, vl);
         Targets t;
         if (!resolveTargets(s, t)) { ++stats.failedDraws; return false; }
         // Las imágenes muestreadas no pueden ser a la vez destino.
         for (uint32_t i = 0; i < t.nColor; ++i)
-            for (auto& ii : img)
-                for (auto& [k, v] : t.color[i]->views) if (ii.imageView == v) ii = {defaultSampler, view(dummy2D, VK_IMAGE_VIEW_TYPE_2D, false, 0, 1, 0, 1, true), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            for (uint32_t j = 0; j < kSamplerBindings; ++j)
+                if (boundImg[j] == t.color[i])
+                    img[j] = {defaultSampler, dummy2DView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         // Búferes (antes del pase no hace falta: son copias de CPU).
         VkBuffer vbuf[17] = {};
         VkDeviceSize voff[17] = {};
@@ -1250,47 +1570,106 @@ public:
         VkDescriptorBufferInfo ubo[2];
         if (!uniforms(s, true, vs->info, ubo[0]) || !uniforms(s, false, ps->info, ubo[1])) return false;
 
-        const VkRenderPass rp = beginPass(t);
+        const bool fullOverwrite = !passOpen && t.nColor == 1 && t.depth == nullptr &&
+                                   s.renderState[27] == 0 && s.renderState[15] == 0 && s.renderState[174] == 0 &&
+                                   (s.renderState[168] & 0xFu) == 0xFu &&
+                                   !indexed && (prim == 4 || prim == 5) && primCount <= 2 &&
+                                   (s.viewport[2] == 0 || (s.viewport[0] == 0 && s.viewport[1] == 0 &&
+                                                           s.viewport[2] >= t.w && s.viewport[3] >= t.h));
+        const VkRenderPass rp = beginPass(t, fullOverwrite ? 1u : 0u);
         if (rp == VK_NULL_HANDLE) { ++stats.failedDraws; return false; }
         const VkPipeline p = pipeline(s, *vs, *ps, vl, prim, t, rp);
         if (p == VK_NULL_HANDLE) { ++stats.failedDraws; return false; }
-        VkDescriptorSet set = allocSet(setLayout);
-        if (set == VK_NULL_HANDLE) return false;
-        VkWriteDescriptorSet w[2 + kSamplerBindings]{};
-        for (uint32_t i = 0; i < 2; ++i) {
-            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[i].dstSet = set;
-            w[i].dstBinding = i;
-            w[i].descriptorCount = 1;
-            w[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            w[i].pBufferInfo = &ubo[i];
-        }
+        Frame& fr = frames[slot];
+        DescKey dk;
+        dk.b0 = reinterpret_cast<uint64_t>(ubo[0].buffer);
+        dk.b1 = reinterpret_cast<uint64_t>(ubo[1].buffer);
         for (uint32_t i = 0; i < kSamplerBindings; ++i) {
-            VkWriteDescriptorSet& x = w[2 + i];
-            x.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            x.dstSet = set;
-            x.dstBinding = 2 + i;
-            x.descriptorCount = 1;
-            x.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            x.pImageInfo = &img[i];
+            dk.imgs[i * 2] = reinterpret_cast<uint64_t>(img[i].imageView);
+            dk.imgs[i * 2 + 1] = reinterpret_cast<uint64_t>(img[i].sampler);
         }
-        f.vkUpdateDescriptorSets(ctx.device, 2 + kSamplerBindings, w, 0, nullptr);
-        VkCommandBuffer cmd = frames[slot].cmd;
-        f.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
-        f.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLayout, 0, 1, &set, 0, nullptr);
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        if (auto it = fr.descCache.find(dk); it != fr.descCache.end()) {
+            set = it->second;
+        } else {
+            set = allocSet(setLayout);
+            if (set == VK_NULL_HANDLE) return false;
+            VkDescriptorBufferInfo dynBase[2] = {
+                {ubo[0].buffer, 0, kUboSize},
+                {ubo[1].buffer, 0, kUboSize},
+            };
+            VkWriteDescriptorSet w[2 + kSamplerBindings]{};
+            for (uint32_t i = 0; i < 2; ++i) {
+                w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w[i].dstSet = set;
+                w[i].dstBinding = i;
+                w[i].descriptorCount = 1;
+                w[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+                w[i].pBufferInfo = &dynBase[i];
+            }
+            for (uint32_t i = 0; i < kSamplerBindings; ++i) {
+                VkWriteDescriptorSet& x = w[2 + i];
+                x.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                x.dstSet = set;
+                x.dstBinding = 2 + i;
+                x.descriptorCount = 1;
+                x.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                x.pImageInfo = &img[i];
+            }
+            f.vkUpdateDescriptorSets(ctx.device, 2 + kSamplerBindings, w, 0, nullptr);
+            fr.descCache.emplace(dk, set);
+        }
+        VkCommandBuffer cmd = fr.cmd;
+        if (fr.lastPipeline != p) {
+            f.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+            fr.lastPipeline = p;
+        }
+        const uint32_t dynOff[2] = {static_cast<uint32_t>(ubo[0].offset), static_cast<uint32_t>(ubo[1].offset)};
+        if (fr.lastSet != set || fr.lastDyn0 != dynOff[0] || fr.lastDyn1 != dynOff[1]) {
+            f.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeLayout, 0, 1, &set, 2, dynOff);
+            fr.lastSet = set;
+            fr.lastDyn0 = dynOff[0];
+            fr.lastDyn1 = dynOff[1];
+        }
         setViewportScissor(s, t);
         const uint32_t bf = s.renderState[193];
-        const float blend[4] = {((bf >> 16) & 0xFF) / 255.0f, ((bf >> 8) & 0xFF) / 255.0f, (bf & 0xFF) / 255.0f, (bf >> 24) / 255.0f};
-        f.vkCmdSetBlendConstants(cmd, blend);
-        f.vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s.renderState[57] & 0xFF);
-        float bias = 0.0f, slope = 0.0f;
-        std::memcpy(&bias, &s.renderState[195], 4);
-        std::memcpy(&slope, &s.renderState[175], 4);
+        if (!fr.hasDynState || fr.lastBlend != bf) {
+            const float blend[4] = {((bf >> 16) & 0xFF) / 255.0f, ((bf >> 8) & 0xFF) / 255.0f, (bf & 0xFF) / 255.0f, (bf >> 24) / 255.0f};
+            f.vkCmdSetBlendConstants(cmd, blend);
+            fr.lastBlend = bf;
+        }
+        const uint32_t stRef = s.renderState[57] & 0xFF;
+        if (!fr.hasDynState || fr.lastStencil != stRef) {
+            f.vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stRef);
+            fr.lastStencil = stRef;
+        }
+        const uint32_t b195 = s.renderState[195], s175 = s.renderState[175];
         const float units = (t.depth != nullptr && t.depth->format == VK_FORMAT_D16_UNORM) ? 65535.0f : 16777215.0f;
-        f.vkCmdSetDepthBias(cmd, bias * units, 0.0f, slope);
-        for (const auto& b : vl.bindings) f.vkCmdBindVertexBuffers(cmd, b.binding, 1, &vbuf[b.binding], &voff[b.binding]);
+        if (!fr.hasDynState || fr.lastBias195 != b195 || fr.lastSlope175 != s175 || fr.lastUnits != units) {
+            float bias = 0.0f, slope = 0.0f;
+            std::memcpy(&bias, &b195, 4);
+            std::memcpy(&slope, &s175, 4);
+            f.vkCmdSetDepthBias(cmd, bias * units, 0.0f, slope);
+            fr.lastBias195 = b195;
+            fr.lastSlope175 = s175;
+            fr.lastUnits = units;
+        }
+        fr.hasDynState = true;
+        for (const auto& b : vl.bindings) {
+            if (fr.lastVbuf[b.binding] != vbuf[b.binding] || fr.lastVoff[b.binding] != voff[b.binding]) {
+                f.vkCmdBindVertexBuffers(cmd, b.binding, 1, &vbuf[b.binding], &voff[b.binding]);
+                fr.lastVbuf[b.binding] = vbuf[b.binding];
+                fr.lastVoff[b.binding] = voff[b.binding];
+            }
+        }
         if (indexed) {
-            f.vkCmdBindIndexBuffer(cmd, ibuf, ioff, s.indexFormat == 102 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+            const VkIndexType itype = s.indexFormat == 102 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+            if (fr.lastIbuf != ibuf || fr.lastIoff != ioff || fr.lastItype != itype) {
+                f.vkCmdBindIndexBuffer(cmd, ibuf, ioff, itype);
+                fr.lastIbuf = ibuf;
+                fr.lastIoff = ioff;
+                fr.lastItype = itype;
+            }
             f.vkCmdDrawIndexed(cmd, count, std::max(1u, instances), first, baseVertex, 0);
         } else {
             f.vkCmdDraw(cmd, count, std::max(1u, instances), first, 0);
@@ -1304,6 +1683,51 @@ public:
         if (!beginFrame()) return;
         Targets t;
         if (!resolveTargets(s, t)) return;
+        const bool fullTarget = (rectCount == 0 || rects == nullptr) && s.renderState[174] == 0 &&
+                                (s.viewport[2] == 0 || (s.viewport[0] == 0 && s.viewport[1] == 0 &&
+                                                        s.viewport[2] >= t.w && s.viewport[3] >= t.h));
+        if (!passOpen && fullTarget) {
+            if (flags & 1) {
+                VkClearColorValue ccv{};
+                ccv.float32[0] = ((color >> 16) & 0xFF) / 255.0f;
+                ccv.float32[1] = ((color >> 8) & 0xFF) / 255.0f;
+                ccv.float32[2] = (color & 0xFF) / 255.0f;
+                ccv.float32[3] = (color >> 24) / 255.0f;
+                for (uint32_t i = 0; i < t.nColor; ++i) {
+                    if (s.targets[i].level == 0 && s.targets[i].face == 0) {
+                        t.color[i]->pendingColorClear = true;
+                        t.color[i]->pendingColor = ccv;
+                        t.color[i]->pendingMip = 0;
+                        t.color[i]->pendingLayer = 0;
+                    } else {
+                        barrier(*t.color[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                        VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, s.targets[i].level, 1, s.targets[i].face, 1};
+                        f.vkCmdClearColorImage(frames[slot].cmd, t.color[i]->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &ccv, 1, &rng);
+                    }
+                }
+            }
+            if (t.depth != nullptr && (flags & 6)) {
+                VkImageAspectFlags asp = 0;
+                if (flags & 2) asp |= VK_IMAGE_ASPECT_DEPTH_BIT;
+                if ((flags & 4) && t.depth->fmt.stencil) asp |= VK_IMAGE_ASPECT_STENCIL_BIT;
+                if (asp != 0) {
+                    const VkClearDepthStencilValue dsv{std::clamp(z, 0.0f, 1.0f), stencil & 0xFF};
+                    if (s.depth.level == 0 && s.depth.face == 0) {
+                        t.depth->pendingDepthClear = true;
+                        t.depth->pendingDepthAsp |= asp;
+                        t.depth->pendingDepth = dsv;
+                        t.depth->pendingMip = 0;
+                        t.depth->pendingLayer = 0;
+                    } else {
+                        barrier(*t.depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                        VkImageSubresourceRange rng{asp, s.depth.level, 1, s.depth.face, 1};
+                        f.vkCmdClearDepthStencilImage(frames[slot].cmd, t.depth->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dsv, 1, &rng);
+                    }
+                }
+            }
+            ++stats.clears;
+            return;
+        }
         if (beginPass(t) == VK_NULL_HANDLE) return;
         std::vector<VkClearAttachment> att;
         if (flags & 1) {
@@ -1469,6 +1893,25 @@ public:
         gi.layout = presentLayout;
         gi.renderPass = presentPass;
         const bool okp = f.vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &gi, nullptr, &presentPipeline) == VK_SUCCESS;
+        if (okp && sgsrPipeline == VK_NULL_HANDLE) {
+            const VkPushConstantRange ranges[2] = {{VK_SHADER_STAGE_VERTEX_BIT, 0, 32},
+                                                   {VK_SHADER_STAGE_FRAGMENT_BIT, 32, 32}};
+            VkPipelineLayoutCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            si.setLayoutCount = 1;
+            si.pSetLayouts = &presentSetLayout;
+            si.pushConstantRangeCount = 2;
+            si.pPushConstantRanges = ranges;
+            const std::vector<uint32_t> sgCode(std::begin(gpu::kPresentSgsrFragSpv), std::end(gpu::kPresentSgsrFragSpv));
+            VkShaderModule sgm = makeModule(sgCode);
+            if (sgm != VK_NULL_HANDLE && f.vkCreatePipelineLayout(ctx.device, &si, nullptr, &sgsrLayout) == VK_SUCCESS) {
+                stages[1].module = sgm;
+                gi.layout = sgsrLayout;
+                if (f.vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &gi, nullptr, &sgsrPipeline) != VK_SUCCESS) {
+                    sgsrPipeline = VK_NULL_HANDLE;
+                }
+            }
+            if (sgm != VK_NULL_HANDLE) f.vkDestroyShaderModule(ctx.device, sgm, nullptr);
+        }
         f.vkDestroyShaderModule(ctx.device, vsm, nullptr);
         f.vkDestroyShaderModule(ctx.device, fsm, nullptr);
         if (!okp) presentPipeline = VK_NULL_HANDLE;
@@ -1476,6 +1919,8 @@ public:
     }
 
     bool present(const TexRef& bb) {
+        timespec tp0{}, tp1{};
+        clock_gettime(CLOCK_MONOTONIC, &tp0);
         if (!beginFrame()) return false;
         GpuImage* g = image(bb, true);
         Frame& fr = frames[slot];
@@ -1483,6 +1928,20 @@ public:
         endPass();
         if (g != nullptr) {
             barrier(*g, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            VkImageView fgView = VK_NULL_HANDLE;
+            int gameFps = 0;
+            bool repeat = false;
+            if (gpu::HyperFrameGen::enabled()) {
+                gameFps = pacing::effectiveCap();
+                fgView = gpu::HyperFrameGen::shared().record(fr.cmd, g->image, g->format, g->width, g->height, gameFps);
+            } else if (const int cap = pacing::effectiveCap();
+                       !pacing::thermalRelaxed() &&
+                       gpu::HyperFrameGen::repeatWanted(cap, static_cast<int>(::hyperplay::win32::refreshHz()))) {
+                gameFps = cap;
+                repeat = gpu::HyperFrameGen::shared().recordRepeat(fr.cmd, g->image, g->format, g->width, g->height, cap);
+            } else {
+                gpu::HyperFrameGen::shared().releaseIfIdle();
+            }
             DirectVulkanBridge::SwapTarget target;
             if (DirectVulkanBridge::shared().beginPresent(target)) {
                 bool recorded = false;
@@ -1504,7 +1963,7 @@ public:
                         f.vkCreateFramebuffer(ctx.device, &fi, nullptr, &fb);
                     }
                     VkDescriptorSet set = allocSet(presentSetLayout);
-                    VkImageView srcView = view(*g, VK_IMAGE_VIEW_TYPE_2D, false, 0, 1, 0, 1, false);
+                    VkImageView srcView = fgView != VK_NULL_HANDLE ? fgView : view(*g, VK_IMAGE_VIEW_TYPE_2D, false, 0, 1, 0, 1, false);
                     if (fb != VK_NULL_HANDLE && set != VK_NULL_HANDLE && srcView != VK_NULL_HANDLE) {
                         VkDescriptorImageInfo info{presentSampler, srcView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
                         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1519,8 +1978,17 @@ public:
                         bi.framebuffer = fb;
                         bi.renderArea = {{0, 0}, target.extent};
                         f.vkCmdBeginRenderPass(fr.cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
-                        f.vkCmdBindPipeline(fr.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, presentPipeline);
-                        f.vkCmdBindDescriptorSets(fr.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, presentLayout, 0, 1, &set, 0, nullptr);
+                        const bool sgsr = sgsrPipeline != VK_NULL_HANDLE && fgView == VK_NULL_HANDLE &&
+                                          gpu::presentopt::useSgsr(g->width, g->height, target.extent.width, target.extent.height);
+                        const VkPipelineLayout pLayout = sgsr ? sgsrLayout : presentLayout;
+                        f.vkCmdBindPipeline(fr.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sgsr ? sgsrPipeline : presentPipeline);
+                        f.vkCmdBindDescriptorSets(fr.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pLayout, 0, 1, &set, 0, nullptr);
+                        if (sgsr) {
+                            const float w = static_cast<float>(g->width), h = static_cast<float>(g->height);
+                            const float fp[8] = {1.0f / w, 1.0f / h, w, h,
+                                                 gpu::presentopt::g_sharpness.load(std::memory_order_relaxed), 0, 0, 0};
+                            f.vkCmdPushConstants(fr.cmd, pLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 32, 32, fp);
+                        }
                         VkViewport vp{0, 0, static_cast<float>(target.extent.width), static_cast<float>(target.extent.height), 0, 1};
                         VkRect2D sc{{0, 0}, target.extent};
                         f.vkCmdSetViewport(fr.cmd, 0, 1, &vp);
@@ -1533,7 +2001,7 @@ public:
                             default: break;
                         }
                         gpu::presentopt::applyFit(pc, g->width, g->height, target.extent.width, target.extent.height);
-                        f.vkCmdPushConstants(fr.cmd, presentLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pc);
+                        f.vkCmdPushConstants(fr.cmd, pLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pc);
                         f.vkCmdDraw(fr.cmd, 3, 1, 0, 0);
                         f.vkCmdEndRenderPass(fr.cmd);
                         recorded = true;
@@ -1546,12 +2014,18 @@ public:
                     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                     b.image = target.image;
                     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                    f.vkCmdPipelineBarrier(fr.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
-                                           nullptr, 0, nullptr, 1, &b);
+                    f.vkCmdPipelineBarrier(fr.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                                           0, nullptr, 0, nullptr, 1, &b);
                 }
                 f.vkEndCommandBuffer(fr.cmd);
                 presented = DirectVulkanBridge::shared().endPresent(target, fr.cmd, fr.fence);
                 recording = false;
+                if ((fgView != VK_NULL_HANDLE || repeat) && presented && gameFps > 0) {
+                    timespec t{};
+                    clock_gettime(CLOCK_MONOTONIC, &t);
+                    const int64_t now = static_cast<int64_t>(t.tv_sec) * 1000000000LL + t.tv_nsec;
+                    gpu::HyperFrameGen::shared().scheduleReal(now + 500000000LL / gameFps);
+                }
             }
         }
         if (recording) {
@@ -1560,12 +2034,31 @@ public:
             recording = false;
         }
         slot = (slot + 1) % frames.size();
+        clock_gettime(CLOCK_MONOTONIC, &tp1);
+        const int64_t nowNs = static_cast<int64_t>(tp1.tv_sec) * 1000000000LL + tp1.tv_nsec;
+        const int64_t p0Ns = static_cast<int64_t>(tp0.tv_sec) * 1000000000LL + tp0.tv_nsec;
+        statPresentNs += static_cast<uint64_t>(nowNs - p0Ns);
+        if (lastPresentNs != 0 && nowNs - lastPresentNs < 500000000LL) {
+            statFrameNs += static_cast<uint64_t>(nowNs - lastPresentNs);
+        }
+        lastPresentNs = nowNs;
         ++stats.presents;
-        if (stats.presents % 600 == 1)
-            LOGI("D3D9 GPU: presents=%llu draws=%llu fallidos=%llu clears=%llu pipelines=%llu subidas=%llu",
+        if (stats.presents % 600 == 1) {
+            LOGI("D3D9 GPU: presents=%llu draws=%llu fallidos=%llu clears=%llu pipelines=%llu subidas=%llu passes=%.1f(load=%.1f,depth=%.1f)/f (frame=%.1fms draw=%.1fms worker=%.1fms fence=%.1fms pres=%.1fms)",
                  static_cast<unsigned long long>(stats.presents), static_cast<unsigned long long>(stats.draws),
                  static_cast<unsigned long long>(stats.failedDraws), static_cast<unsigned long long>(stats.clears),
-                 static_cast<unsigned long long>(stats.pipelines), static_cast<unsigned long long>(stats.uploads));
+                 static_cast<unsigned long long>(stats.pipelines), static_cast<unsigned long long>(stats.uploads),
+                 static_cast<double>(statPasses) / 600.0,
+                 static_cast<double>(statLoadPasses) / 600.0,
+                 static_cast<double>(statDepthPasses) / 600.0,
+                 static_cast<double>(statFrameNs) / 600000000.0,
+                 static_cast<double>(statDrawNs) / 600000000.0,
+                 static_cast<double>(statWorkerNs) / 600000000.0,
+                 static_cast<double>(statFenceNs) / 600000000.0,
+                 static_cast<double>(statPresentNs) / 600000000.0);
+            statFenceNs = statPresentNs = statFrameNs = statDrawNs = statWorkerNs = 0;
+            statPasses = statLoadPasses = statDepthPasses = 0;
+        }
         return presented;
     }
 
@@ -1584,6 +2077,530 @@ Impl& impl() {
     return *i;
 }
 
+bool asyncEnabled() {
+    static const bool s_on = [] {
+        char v[PROP_VALUE_MAX] = {};
+        return !(__system_property_get("debug.hyperplay.d3d9async", v) > 0 && v[0] == '0');
+    }();
+    return s_on;
+}
+
+// Cola SPSC lock-free (RenderingThread -> d3d9-worker) para desacoplar D3D9 de la grabación/envío Vulkan.
+struct AsyncQueue {
+    enum class Op : uint8_t {
+        VsConst,
+        PsConst,
+        Rs,
+        Ss,
+        Draw,
+        Clear,
+        StretchRect,
+        ColorFill,
+        Present,
+    };
+
+    struct Cmd {
+        Op op = Op::Draw;
+        bool indexed = false;
+        bool hasRect0 = false;
+        bool hasRect1 = false;
+        uint32_t primType = 0;
+        uint32_t primCount = 0;
+        int32_t baseVertex = 0;
+        uint32_t first = 0;
+        uint32_t instances = 1;
+        uint32_t flags = 0;
+        uint32_t color = 0;
+        float z = 1.0f;
+        uint32_t stencil = 0;
+        uint32_t filter = 0;
+        uint32_t rectCount = 0;
+        int32_t rect0[4] = {};
+        int32_t rect1[4] = {};
+        const uint8_t* ptr = nullptr;
+        uint64_t dataTailAfter = 0;
+        DrawState state{};
+        TexRef tex0{};
+        TexRef tex1{};
+    };
+
+    static constexpr uint32_t kCmdCap = 4096;
+    static constexpr uint32_t kCmdMask = kCmdCap - 1;
+    static constexpr uint64_t kDataCap = 32ull << 20;
+    static constexpr uint64_t kDataMask = kDataCap - 1;
+
+    alignas(64) std::atomic<uint32_t> cmdHead{0};
+    alignas(64) std::atomic<uint32_t> cmdTail{0};
+    alignas(64) std::atomic<uint64_t> dataHead{0};
+    alignas(64) std::atomic<uint64_t> dataTail{0};
+    alignas(64) std::atomic<uint64_t> queuedPresents{0};
+    alignas(64) std::atomic<uint64_t> completedPresents{0};
+
+    std::mutex wakeMtx;
+    std::condition_variable workCv;
+    std::condition_variable spaceCv;
+    std::mutex releaseMtx;
+    std::vector<const void*> pendingReleases;
+
+    // Estado exclusivo del productor (RenderingThread)
+    uint32_t writeCmd = 0;
+    uint64_t writeData = 0;
+    uint64_t lastVsGen = 0, lastPsGen = 0, lastRsGen = 0, lastSsGen = 0;
+    std::unordered_map<const void*, uint64_t> lastStreamGen;
+    std::unordered_map<const void*, uint64_t> lastTexGen;
+
+    // Estado exclusivo del consumidor (d3d9-worker)
+    float workerVsF[256 * 4] = {};
+    int32_t workerVsI[16 * 4] = {};
+    uint32_t workerVsB[16] = {};
+    float workerPsF[224 * 4] = {};
+    int32_t workerPsI[16 * 4] = {};
+    uint32_t workerPsB[16] = {};
+    uint32_t workerRs[256] = {};
+    uint32_t workerSs[20][14] = {};
+
+    std::vector<Cmd> cmds;
+    std::vector<uint8_t> dataBuf;
+    std::thread worker;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> ready{false};
+    bool initOk = false;
+    bool started = false;
+    std::mutex initMtx;
+
+    ~AsyncQueue() {
+        stop.store(true, std::memory_order_release);
+        workCv.notify_all();
+        if (worker.joinable()) worker.join();
+    }
+
+    bool ensureStarted() {
+        if (ready.load(std::memory_order_acquire)) return initOk;
+        std::lock_guard<std::mutex> lk(initMtx);
+        if (!started) {
+            cmds.resize(kCmdCap);
+            dataBuf.resize(kDataCap);
+            started = true;
+            worker = std::thread([this] { workerLoop(); });
+        }
+        std::unique_lock<std::mutex> wlk(wakeMtx);
+        spaceCv.wait(wlk, [this] { return ready.load(std::memory_order_acquire); });
+        return initOk;
+    }
+
+    uint8_t* allocData(size_t bytes) {
+        if (bytes == 0) return nullptr;
+        const uint64_t sz = (static_cast<uint64_t>(bytes) + 15ull) & ~15ull;
+        if (sz > kDataCap / 4) return nullptr;
+        const uint64_t off = writeData & kDataMask;
+        const uint64_t gap = (off + sz > kDataCap) ? (kDataCap - off) : 0ull;
+        const uint64_t need = gap + sz;
+        for (int spin = 0; spin < 64; ++spin) {
+            if (kDataCap - (writeData - dataTail.load(std::memory_order_acquire)) >= need) break;
+            workCv.notify_one();
+            sched_yield();
+        }
+        if (kDataCap - (writeData - dataTail.load(std::memory_order_acquire)) < need) {
+            workCv.notify_one();
+            std::unique_lock<std::mutex> lk(wakeMtx);
+            spaceCv.wait(lk, [this, need] {
+                return kDataCap - (writeData - dataTail.load(std::memory_order_acquire)) >= need ||
+                       stop.load(std::memory_order_acquire);
+            });
+        }
+        const uint64_t start = writeData + gap;
+        writeData = start + sz;
+        return dataBuf.data() + (start & kDataMask);
+    }
+
+    void pushCmd(Cmd& c, bool wakeNow = false) {
+        for (int spin = 0; spin < 64; ++spin) {
+            if (writeCmd - cmdTail.load(std::memory_order_acquire) < kCmdCap) break;
+            workCv.notify_one();
+            sched_yield();
+        }
+        if (writeCmd - cmdTail.load(std::memory_order_acquire) >= kCmdCap) {
+            workCv.notify_one();
+            std::unique_lock<std::mutex> lk(wakeMtx);
+            spaceCv.wait(lk, [this] {
+                return writeCmd - cmdTail.load(std::memory_order_acquire) < kCmdCap ||
+                       stop.load(std::memory_order_acquire);
+            });
+        }
+        c.dataTailAfter = writeData;
+        cmds[writeCmd & kCmdMask] = c;
+        dataHead.store(writeData, std::memory_order_release);
+        ++writeCmd;
+        cmdHead.store(writeCmd, std::memory_order_release);
+        if (wakeNow || (writeCmd & 31u) == 0) {
+            workCv.notify_one();
+        }
+    }
+
+    void sync() {
+        if (!ready.load(std::memory_order_acquire)) return;
+        const uint32_t targetCmd = writeCmd;
+        const uint64_t targetPres = queuedPresents.load(std::memory_order_relaxed);
+        workCv.notify_one();
+        std::unique_lock<std::mutex> lk(wakeMtx);
+        spaceCv.wait(lk, [this, targetCmd, targetPres] {
+            return (cmdTail.load(std::memory_order_acquire) == targetCmd &&
+                    completedPresents.load(std::memory_order_acquire) == targetPres) ||
+                   stop.load(std::memory_order_acquire);
+        });
+    }
+
+    void enqueueStateDeltas(const DrawState& s) {
+        if (s.vsF != nullptr && s.vsConstGen != lastVsGen) {
+            constexpr size_t kVsF = 256 * 4 * sizeof(float);
+            constexpr size_t kVsI = 16 * 4 * sizeof(int32_t);
+            constexpr size_t kVsB = 16 * sizeof(uint32_t);
+            uint8_t* p = allocData(kVsF + kVsI + kVsB);
+            if (p != nullptr) {
+                std::memcpy(p, s.vsF, kVsF);
+                std::memcpy(p + kVsF, s.vsI, kVsI);
+                std::memcpy(p + kVsF + kVsI, s.vsB, kVsB);
+                Cmd c;
+                c.op = Op::VsConst;
+                c.ptr = p;
+                pushCmd(c);
+                lastVsGen = s.vsConstGen;
+            }
+        }
+        if (s.psF != nullptr && s.psConstGen != lastPsGen) {
+            constexpr size_t kPsF = 224 * 4 * sizeof(float);
+            constexpr size_t kPsI = 16 * 4 * sizeof(int32_t);
+            constexpr size_t kPsB = 16 * sizeof(uint32_t);
+            uint8_t* p = allocData(kPsF + kPsI + kPsB);
+            if (p != nullptr) {
+                std::memcpy(p, s.psF, kPsF);
+                std::memcpy(p + kPsF, s.psI, kPsI);
+                std::memcpy(p + kPsF + kPsI, s.psB, kPsB);
+                Cmd c;
+                c.op = Op::PsConst;
+                c.ptr = p;
+                pushCmd(c);
+                lastPsGen = s.psConstGen;
+            }
+        }
+        if (s.renderState != nullptr && s.rsGen != lastRsGen) {
+            constexpr size_t kRs = 256 * sizeof(uint32_t);
+            uint8_t* p = allocData(kRs);
+            if (p != nullptr) {
+                std::memcpy(p, s.renderState, kRs);
+                Cmd c;
+                c.op = Op::Rs;
+                c.ptr = p;
+                pushCmd(c);
+                lastRsGen = s.rsGen;
+            }
+        }
+        if (s.samplerState != nullptr && s.ssGen != lastSsGen) {
+            constexpr size_t kSs = 20 * 14 * sizeof(uint32_t);
+            uint8_t* p = allocData(kSs);
+            if (p != nullptr) {
+                std::memcpy(p, s.samplerState, kSs);
+                Cmd c;
+                c.op = Op::Ss;
+                c.ptr = p;
+                pushCmd(c);
+                lastSsGen = s.ssGen;
+            }
+        }
+    }
+
+    void snapshotStream(Stream& st) {
+        if (st.data == nullptr || st.size == 0) return;
+        if (st.key != nullptr) {
+            auto it = lastStreamGen.find(st.key);
+            if (it != lastStreamGen.end() && it->second == st.generation) return;
+        }
+        uint8_t* dst = allocData(st.size);
+        if (dst == nullptr) {
+            sync();
+            return;
+        }
+        std::memcpy(dst, st.data, st.size);
+        st.data = dst;
+        if (st.key != nullptr) lastStreamGen[st.key] = st.generation;
+    }
+
+    void snapshotTex(TexRef& t) {
+        if (!t.valid() || t.data == nullptr || t.subresources == 0 || t.subresourceBytes == nullptr) return;
+        auto it = lastTexGen.find(t.key);
+        if (it != lastTexGen.end() && it->second == t.generation) return;
+        const size_t ptrArrayBytes = static_cast<size_t>(t.subresources) * sizeof(uint8_t*);
+        uint8_t* ptrRaw = allocData(ptrArrayBytes);
+        if (ptrRaw == nullptr) {
+            sync();
+            return;
+        }
+        auto** ptrs = reinterpret_cast<const uint8_t**>(ptrRaw);
+        for (uint32_t i = 0; i < t.subresources; ++i) {
+            const uint8_t* src = t.data[i];
+            const uint32_t sz = t.subresourceBytes[i];
+            if (src != nullptr && sz > 0) {
+                uint8_t* dst = allocData(sz);
+                if (dst == nullptr) {
+                    sync();
+                    return;
+                }
+                std::memcpy(dst, src, sz);
+                ptrs[i] = dst;
+            } else {
+                ptrs[i] = nullptr;
+            }
+        }
+        t.data = ptrs;
+        t.subresourceBytes = nullptr;
+        lastTexGen[t.key] = t.generation;
+    }
+
+    void bindWorkerState(DrawState& s) const {
+        s.vsF = workerVsF;
+        s.vsI = workerVsI;
+        s.vsB = workerVsB;
+        s.psF = workerPsF;
+        s.psI = workerPsI;
+        s.psB = workerPsB;
+        s.renderState = workerRs;
+        s.samplerState = workerSs;
+    }
+
+    bool enqueueDraw(const DrawState& s, uint32_t primType, uint32_t primCount, bool indexed, int32_t baseVertex,
+                     uint32_t first, uint32_t instances) {
+        if (!ensureStarted()) return false;
+        enqueueStateDeltas(s);
+        Cmd c;
+        c.op = Op::Draw;
+        c.indexed = indexed;
+        c.primType = primType;
+        c.primCount = primCount;
+        c.baseVertex = baseVertex;
+        c.first = first;
+        c.instances = instances;
+        c.state = s;
+        for (int k = 0; k < 16; ++k) snapshotStream(c.state.streams[k]);
+        if (indexed) snapshotStream(c.state.indices);
+        for (int k = 0; k < 20; ++k) snapshotTex(c.state.textures[k]);
+        pushCmd(c);
+        return true;
+    }
+
+    void enqueueClear(const DrawState& s, uint32_t rectCount, const int32_t* rects, uint32_t flags, uint32_t color,
+                      float z, uint32_t stencil) {
+        if (!ensureStarted()) return;
+        enqueueStateDeltas(s);
+        Cmd c;
+        c.op = Op::Clear;
+        c.flags = flags;
+        c.color = color;
+        c.z = z;
+        c.stencil = stencil;
+        c.state = s;
+        if (rectCount > 0 && rects != nullptr) {
+            const size_t bytes = static_cast<size_t>(rectCount) * 4 * sizeof(int32_t);
+            uint8_t* p = allocData(bytes);
+            if (p != nullptr) {
+                std::memcpy(p, rects, bytes);
+                c.rectCount = rectCount;
+                c.ptr = p;
+            }
+        }
+        pushCmd(c);
+    }
+
+    bool enqueueStretchRect(const TexRef& src, const int32_t* srcRect, const TexRef& dst, const int32_t* dstRect,
+                            uint32_t filter) {
+        if (!ensureStarted()) return false;
+        Cmd c;
+        c.op = Op::StretchRect;
+        c.tex0 = src;
+        c.tex1 = dst;
+        snapshotTex(c.tex0);
+        snapshotTex(c.tex1);
+        if (srcRect != nullptr) {
+            c.hasRect0 = true;
+            std::memcpy(c.rect0, srcRect, 16);
+        }
+        if (dstRect != nullptr) {
+            c.hasRect1 = true;
+            std::memcpy(c.rect1, dstRect, 16);
+        }
+        c.filter = filter;
+        pushCmd(c);
+        return true;
+    }
+
+    void enqueueColorFill(const TexRef& dst, const int32_t* rect, uint32_t color) {
+        if (!ensureStarted()) return;
+        Cmd c;
+        c.op = Op::ColorFill;
+        c.tex0 = dst;
+        if (rect != nullptr) {
+            c.hasRect0 = true;
+            std::memcpy(c.rect0, rect, 16);
+        }
+        c.color = color;
+        pushCmd(c);
+    }
+
+    bool enqueuePresent(const TexRef& bb) {
+        if (!ensureStarted()) return false;
+        Cmd c;
+        c.op = Op::Present;
+        c.tex0 = bb;
+        const uint64_t q = queuedPresents.fetch_add(1, std::memory_order_relaxed) + 1;
+        pushCmd(c, true);
+        // Backpressure: permite como máximo 1 frame por delante para evitar latencia acumulada.
+        while (q - completedPresents.load(std::memory_order_acquire) >= 2 &&
+               !stop.load(std::memory_order_acquire)) {
+            std::unique_lock<std::mutex> lk(wakeMtx);
+            spaceCv.wait(lk, [this, q] {
+                return (q - completedPresents.load(std::memory_order_acquire) < 2) ||
+                       stop.load(std::memory_order_acquire);
+            });
+        }
+        return true;
+    }
+
+    void enqueueRelease(const void* key) {
+        if (!ready.load(std::memory_order_acquire)) return;
+        std::lock_guard<std::mutex> lk(releaseMtx);
+        pendingReleases.push_back(key);
+    }
+
+    void drainReleases(Impl& i) {
+        std::vector<const void*> local;
+        {
+            std::lock_guard<std::mutex> lk(releaseMtx);
+            if (pendingReleases.empty()) return;
+            local.swap(pendingReleases);
+        }
+        for (const void* k : local) i.release(k);
+    }
+
+    void workerLoop() {
+        pthread_setname_np(pthread_self(), "d3d9-worker");
+        ::hyperplay::pacing::setRenderWorkerThread(static_cast<pid_t>(gettid()));
+        Impl& i = impl();
+        {
+            std::lock_guard<std::mutex> lk(i.mtx);
+            initOk = i.init();
+            ready.store(true, std::memory_order_release);
+        }
+        spaceCv.notify_all();
+        if (!initOk) return;
+
+        uint32_t readCmd = 0;
+        uint64_t frameStartNs = 0;
+        while (!stop.load(std::memory_order_acquire)) {
+            uint32_t head = cmdHead.load(std::memory_order_acquire);
+            if (readCmd == head) {
+                for (int spin = 0; spin < 128; ++spin) {
+                    head = cmdHead.load(std::memory_order_acquire);
+                    if (readCmd != head) break;
+                    sched_yield();
+                }
+                if (readCmd == head) {
+                    drainReleases(i);
+                    std::unique_lock<std::mutex> lk(wakeMtx);
+                    workCv.wait(lk, [this, readCmd] {
+                        return cmdHead.load(std::memory_order_acquire) != readCmd ||
+                               stop.load(std::memory_order_acquire);
+                    });
+                    continue;
+                }
+            }
+
+            if (frameStartNs == 0) {
+                timespec ts{};
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                frameStartNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
+            }
+
+            while (readCmd != head) {
+                const Cmd& c = cmds[readCmd & kCmdMask];
+                switch (c.op) {
+                    case Op::VsConst: {
+                        constexpr size_t kVsF = 256 * 4 * sizeof(float);
+                        constexpr size_t kVsI = 16 * 4 * sizeof(int32_t);
+                        constexpr size_t kVsB = 16 * sizeof(uint32_t);
+                        std::memcpy(workerVsF, c.ptr, kVsF);
+                        std::memcpy(workerVsI, c.ptr + kVsF, kVsI);
+                        std::memcpy(workerVsB, c.ptr + kVsF + kVsI, kVsB);
+                        break;
+                    }
+                    case Op::PsConst: {
+                        constexpr size_t kPsF = 224 * 4 * sizeof(float);
+                        constexpr size_t kPsI = 16 * 4 * sizeof(int32_t);
+                        constexpr size_t kPsB = 16 * sizeof(uint32_t);
+                        std::memcpy(workerPsF, c.ptr, kPsF);
+                        std::memcpy(workerPsI, c.ptr + kPsF, kPsI);
+                        std::memcpy(workerPsB, c.ptr + kPsF + kPsI, kPsB);
+                        break;
+                    }
+                    case Op::Rs:
+                        std::memcpy(workerRs, c.ptr, 256 * sizeof(uint32_t));
+                        break;
+                    case Op::Ss:
+                        std::memcpy(workerSs, c.ptr, 20 * 14 * sizeof(uint32_t));
+                        break;
+                    case Op::Draw: {
+                        DrawState s = c.state;
+                        bindWorkerState(s);
+                        timespec td0{}, td1{};
+                        clock_gettime(CLOCK_MONOTONIC, &td0);
+                        i.draw(s, c.primType, c.primCount, c.indexed, c.baseVertex, c.first, c.instances);
+                        clock_gettime(CLOCK_MONOTONIC, &td1);
+                        i.statDrawNs += static_cast<uint64_t>((td1.tv_sec - td0.tv_sec) * 1000000000LL +
+                                                              (td1.tv_nsec - td0.tv_nsec));
+                        break;
+                    }
+                    case Op::Clear: {
+                        DrawState s = c.state;
+                        bindWorkerState(s);
+                        i.clear(s, c.rectCount, reinterpret_cast<const int32_t*>(c.ptr), c.flags, c.color, c.z,
+                                c.stencil);
+                        break;
+                    }
+                    case Op::StretchRect:
+                        i.stretchRect(c.tex0, c.hasRect0 ? c.rect0 : nullptr, c.tex1,
+                                      c.hasRect1 ? c.rect1 : nullptr, c.filter);
+                        break;
+                    case Op::ColorFill:
+                        i.colorFill(c.tex0, c.hasRect0 ? c.rect0 : nullptr, c.color);
+                        break;
+                    case Op::Present: {
+                        i.present(c.tex0);
+                        if (frameStartNs != 0) {
+                            timespec ts{};
+                            clock_gettime(CLOCK_MONOTONIC, &ts);
+                            const uint64_t now =
+                                static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
+                            i.statWorkerNs += now - frameStartNs;
+                            frameStartNs = 0;
+                        }
+                        drainReleases(i);
+                        completedPresents.fetch_add(1, std::memory_order_release);
+                        spaceCv.notify_all();
+                        break;
+                    }
+                }
+                dataTail.store(c.dataTailAfter, std::memory_order_release);
+                ++readCmd;
+                cmdTail.store(readCmd, std::memory_order_release);
+            }
+            spaceCv.notify_all();
+        }
+    }
+};
+
+AsyncQueue& asyncQueue() {
+    static AsyncQueue* q = new AsyncQueue();
+    return *q;
+}
+
 }  // namespace
 
 Renderer& Renderer::shared() {
@@ -1591,42 +2608,69 @@ Renderer& Renderer::shared() {
     return r;
 }
 bool Renderer::available() {
+    if (asyncEnabled()) return asyncQueue().ensureStarted();
     Impl& i = impl();
     std::lock_guard<std::mutex> lk(i.mtx);
     return i.init();
 }
 bool Renderer::draw(const DrawState& s, uint32_t primType, uint32_t primCount, bool indexed, int32_t baseVertex, uint32_t first,
                     uint32_t instances) {
+    if (asyncEnabled()) {
+        return asyncQueue().enqueueDraw(s, primType, primCount, indexed, baseVertex, first, instances);
+    }
     Impl& i = impl();
     std::lock_guard<std::mutex> lk(i.mtx);
-    return i.init() && i.draw(s, primType, primCount, indexed, baseVertex, first, instances);
+    if (!i.init()) return false;
+    timespec td0{}, td1{};
+    clock_gettime(CLOCK_MONOTONIC, &td0);
+    const bool ok = i.draw(s, primType, primCount, indexed, baseVertex, first, instances);
+    clock_gettime(CLOCK_MONOTONIC, &td1);
+    i.statDrawNs += static_cast<uint64_t>((td1.tv_sec - td0.tv_sec) * 1000000000LL + (td1.tv_nsec - td0.tv_nsec));
+    return ok;
 }
 void Renderer::clear(const DrawState& s, uint32_t rectCount, const int32_t* rects, uint32_t flags, uint32_t color, float z,
                      uint32_t stencil) {
+    if (asyncEnabled()) {
+        asyncQueue().enqueueClear(s, rectCount, rects, flags, color, z, stencil);
+        return;
+    }
     Impl& i = impl();
     std::lock_guard<std::mutex> lk(i.mtx);
     if (i.init()) i.clear(s, rectCount, rects, flags, color, z, stencil);
 }
 bool Renderer::stretchRect(const TexRef& src, const int32_t* srcRect, const TexRef& dst, const int32_t* dstRect,
                            uint32_t filter) {
+    if (asyncEnabled()) return asyncQueue().enqueueStretchRect(src, srcRect, dst, dstRect, filter);
     Impl& i = impl();
     std::lock_guard<std::mutex> lk(i.mtx);
     return i.init() && i.stretchRect(src, srcRect, dst, dstRect, filter);
 }
 void Renderer::colorFill(const TexRef& dst, const int32_t* rect, uint32_t color) {
+    if (asyncEnabled()) {
+        asyncQueue().enqueueColorFill(dst, rect, color);
+        return;
+    }
     Impl& i = impl();
     std::lock_guard<std::mutex> lk(i.mtx);
     if (i.init()) i.colorFill(dst, rect, color);
 }
 bool Renderer::present(const TexRef& bb) {
+    if (asyncEnabled()) return asyncQueue().enqueuePresent(bb);
     Impl& i = impl();
     std::lock_guard<std::mutex> lk(i.mtx);
     return i.init() && i.present(bb);
 }
 void Renderer::release(const void* key) {
+    if (asyncEnabled()) {
+        asyncQueue().enqueueRelease(key);
+        return;
+    }
     Impl& i = impl();
     std::lock_guard<std::mutex> lk(i.mtx);
     if (i.ok) i.release(key);
+}
+void Renderer::sync() {
+    if (asyncEnabled()) asyncQueue().sync();
 }
 Renderer::Stats Renderer::stats() const {
     Impl& i = impl();

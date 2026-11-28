@@ -419,6 +419,7 @@ class GameSessionActivity : ComponentActivity() {
             val frames = HyperPlayNative.nativeDirectFramesPresented()
             state.elapsedMillis = now - startedAt
             state.presentFps = HyperPlayNative.nativeDirectPresentFps()
+            state.gameFps = HyperPlayNative.nativeGameFps()
             state.receivedFps = GameSessionLogic.ratePerSecond(lastFrames, frames, now - lastAt)
             logStartupMilestone(state.receivedFps)
             lastFrames = frames

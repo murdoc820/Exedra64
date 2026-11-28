@@ -76,7 +76,9 @@ jobs:
           VER="${{ steps.ver.outputs.name }}"
           awk -v v="## $VER" '$0==v{f=1;next} /^## /{if(f)exit} f' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "Exedra64 $VER" > notes.md
-          gh release create "$GITHUB_REF_NAME" out/* \
+          # A tag with a suffix (v1.3.0-beta) is published as a pre-release.
+          PRE=""; case "$VER" in *-*) PRE="--prerelease";; esac
+          gh release create "$GITHUB_REF_NAME" out/* $PRE \
             --title "Exedra64 $VER" \
             --notes-file notes.md \
             --generate-notes

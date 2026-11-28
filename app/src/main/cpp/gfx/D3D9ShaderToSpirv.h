@@ -54,6 +54,9 @@ struct ShaderInfo {
     struct FloatDef { uint32_t reg; float v[4]; };
     std::vector<FloatDef> floatDefs;
     bool relativeConst = false;  // c[a0/aL + n]: el renderizador debe copiar los def en el bloque
+    uint16_t maxFloatConst = 0;  // número de vec4 en c[] realmente leídos (256 si relativeConst)
+    bool usesIntConst = false;
+    bool usesBoolConst = false;
     bool writesDepth = false;
     uint32_t colorOutputs = 0;   // máscara oC#
 };
@@ -82,7 +85,7 @@ inline uint32_t regType(uint32_t t) { return ((t >> 28) & 7) | ((t >> 8) & 0x18)
 
 class Translator {
 public:
-    Translator(const uint32_t* t, size_t n) : tok_(t), count_(n) {}
+    Translator(const uint32_t* t, size_t n, bool alphaTest = true) : tok_(t), count_(n), alphaTest_(alphaTest) {}
 
     bool run(std::vector<uint32_t>& out, ShaderInfo& info, std::string& err) {
         if (count_ < 2) return fail("shader vacío");
@@ -165,9 +168,22 @@ private:
             }
             for (uint32_t k = 1; k <= len; ++k) {  // ¿constantes con índice relativo?
                 const uint32_t s = tok_[p + k];
-                if (op != 31 && op != 81 && op != 47 && op != 48 && (s & 0x80000000u) && (s & (1u << 13)) &&
-                    regType(s) == kConst)
-                    info_->relativeConst = true;
+                if (op != 31 && op != 81 && op != 47 && op != 48 && (s & 0x80000000u)) {
+                    const uint32_t rt = regType(s);
+                    if (rt == kConst) {
+                        if (s & (1u << 13)) {
+                            info_->relativeConst = true;
+                            info_->maxFloatConst = 256;
+                        } else {
+                            const uint16_t end = static_cast<uint16_t>((s & 0x7FFu) + 1u);
+                            if (end > info_->maxFloatConst) info_->maxFloatConst = std::min<uint16_t>(end, 256u);
+                        }
+                    } else if (rt == kConstInt) {
+                        info_->usesIntConst = true;
+                    } else if (rt == kConstBool) {
+                        info_->usesBoolConst = true;
+                    }
+                }
             }
             p += 1 + len;
         }
@@ -830,31 +846,34 @@ private:
             b_.op(OpStore, {out, comp(loadPtr(depthOut_), 0)});
         }
         // Prueba alfa de función fija: alphaTest = {func D3DCMP, ref, -, -}; func 8 (ALWAYS) o 0 = desactivada.
-        const uint32_t at = b_.value(OpLoad, tV4_, {b_.value(OpAccessChain, pUniV4_, {ubo_, b_.constI(3)})});
-        const uint32_t func = b_.value(OpConvertFToS, tI_, {comp(at, 0)});
-        const uint32_t ref = comp(at, 1);
-        uint32_t a = b_.constF(1.0f);
-        auto it = colorOut_.find(0);
-        if (it != colorOut_.end()) a = comp(loadPtr(it->second), 3);
-        auto is = [&](int v) { return b_.value(OpIEqual, tB_, {func, b_.constI(v)}); };
-        auto land = [&](uint32_t x, uint32_t y) { return b_.value(167, tB_, {x, y}); };
-        auto lor = [&](uint32_t x, uint32_t y) { return b_.value(166, tB_, {x, y}); };
-        uint32_t pass = lor(is(8), is(0));
-        pass = lor(pass, land(is(2), b_.value(OpFOrdLessThan, tB_, {a, ref})));
-        pass = lor(pass, land(is(3), b_.value(OpFOrdEqual, tB_, {a, ref})));
-        pass = lor(pass, land(is(4), b_.value(188, tB_, {a, ref})));
-        pass = lor(pass, land(is(5), b_.value(186, tB_, {a, ref})));
-        pass = lor(pass, land(is(6), b_.value(OpFUnordNotEqual, tB_, {a, ref})));
-        pass = lor(pass, land(is(7), b_.value(OpFOrdGreaterThanEqual, tB_, {a, ref})));
-        killIf(b_.value(168 /*LogicalNot*/, tB_, {pass}));
+        if (alphaTest_) {
+            const uint32_t at = b_.value(OpLoad, tV4_, {b_.value(OpAccessChain, pUniV4_, {ubo_, b_.constI(3)})});
+            const uint32_t func = b_.value(OpConvertFToS, tI_, {comp(at, 0)});
+            const uint32_t ref = comp(at, 1);
+            uint32_t a = b_.constF(1.0f);
+            auto it = colorOut_.find(0);
+            if (it != colorOut_.end()) a = comp(loadPtr(it->second), 3);
+            auto is = [&](int v) { return b_.value(OpIEqual, tB_, {func, b_.constI(v)}); };
+            auto land = [&](uint32_t x, uint32_t y) { return b_.value(167, tB_, {x, y}); };
+            auto lor = [&](uint32_t x, uint32_t y) { return b_.value(166, tB_, {x, y}); };
+            uint32_t pass = lor(is(8), is(0));
+            pass = lor(pass, land(is(2), b_.value(OpFOrdLessThan, tB_, {a, ref})));
+            pass = lor(pass, land(is(3), b_.value(OpFOrdEqual, tB_, {a, ref})));
+            pass = lor(pass, land(is(4), b_.value(188, tB_, {a, ref})));
+            pass = lor(pass, land(is(5), b_.value(186, tB_, {a, ref})));
+            pass = lor(pass, land(is(6), b_.value(OpFUnordNotEqual, tB_, {a, ref})));
+            pass = lor(pass, land(is(7), b_.value(OpFOrdGreaterThanEqual, tB_, {a, ref})));
+            killIf(b_.value(168 /*LogicalNot*/, tB_, {pass}));
+        }
     }
+    bool alphaTest_ = true;
 };
 
 }  // namespace detail
 
 inline bool translate(const uint32_t* tokens, size_t count, std::vector<uint32_t>& spirv, ShaderInfo& info,
-                      std::string& err) {
-    detail::Translator t(tokens, count);
+                      std::string& err, bool alphaTest = true) {
+    detail::Translator t(tokens, count, alphaTest);
     return t.run(spirv, info, err);
 }
 

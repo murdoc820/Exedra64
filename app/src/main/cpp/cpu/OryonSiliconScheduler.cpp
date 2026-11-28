@@ -136,18 +136,24 @@ OryonSiliconScheduler::~OryonSiliconScheduler() noexcept {
 // mantener los Prime al máximo; si se acerca al límite, sube.
 bool OryonSiliconScheduler::ensureFrameSession(const pid_t* tids, size_t count, int64_t targetNs) noexcept {
     std::lock_guard<std::mutex> lock(frameMutex_);
-    if (frameSession_ != nullptr) return true;
-    if (frameSessionFailed_ || count == 0 || targetNs <= 0) return false;
+    int32_t ids[8];
+    size_t n = 0;
+    for (size_t i = 0; i < count && n < 8; ++i) {
+        if (tids[i] > 0) ids[n++] = static_cast<int32_t>(tids[i]);
+    }
+    if (frameSession_ != nullptr) {
+        if (n <= frameTidCount_) return true;
+        AdpfApi& api = adpfApi();
+        if (api.closeSession != nullptr) api.closeSession(frameSession_);
+        frameSession_ = nullptr;
+        frameTidCount_ = 0;
+    }
+    if (frameSessionFailed_ || n == 0 || targetNs <= 0) return false;
     AdpfApi& api = adpfApi();
     if (api.manager == nullptr || api.createSession == nullptr || api.reportActual == nullptr) {
         frameSessionFailed_ = true;
         LOGW("ADPF por frame no disponible");
         return false;
-    }
-    int32_t ids[8];
-    size_t n = 0;
-    for (size_t i = 0; i < count && n < 8; ++i) {
-        if (tids[i] > 0) ids[n++] = static_cast<int32_t>(tids[i]);
     }
     frameSession_ = api.createSession(api.manager, ids, n, targetNs);
     if (frameSession_ == nullptr) {
@@ -155,6 +161,7 @@ bool OryonSiliconScheduler::ensureFrameSession(const pid_t* tids, size_t count, 
         LOGW("ADPF por frame: createSession falló (%zu hilos, objetivo %lld ns)", n, static_cast<long long>(targetNs));
         return false;
     }
+    frameTidCount_ = n;
     frameTargetNs_ = targetNs;
     LOGI("ADPF por frame activo: %zu hilos, objetivo %.2f ms", n, static_cast<double>(targetNs) / 1e6);
     return true;

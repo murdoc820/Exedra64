@@ -26,6 +26,8 @@ std::mutex g_pauseMutex;
 std::condition_variable g_pauseCv;
 std::atomic<bool> g_paused{false};
 std::atomic<pid_t> g_mainTid{0};
+std::atomic<pid_t> g_renderTid{0};
+std::atomic<pid_t> g_workerTid{0};
 std::atomic<bool> g_relax{false};
 
 OryonSiliconScheduler& scheduler() {
@@ -69,6 +71,14 @@ bool primePinEnabled() {
     return s_on;
 }
 
+bool cpuPin32Enabled() {
+    static const bool s_on = [] {
+        char v[PROP_VALUE_MAX] = {};
+        return __system_property_get("debug.hyperplay.cpupin32", v) > 0 && v[0] == '1';
+    }();
+    return s_on;
+}
+
 // Objetivo que se pide a ADPF: el 80 % del periodo del tope. Con el periodo exacto el reloj se
 // quedaba justo y los frames que se pasaban unas décimas caían al vsync siguiente (60 -> 57 fps).
 // `setprop debug.hyperplay.adpfpct <50-100>` lo ajusta para pruebas A/B.
@@ -81,7 +91,30 @@ int64_t adpfMarginPct() {
     return s_pct;
 }
 
+// FPS reales del juego: una muestra por llamada a paceFrame(), ventana de 500 ms.
+std::atomic<float> g_gameFps{0.0f};
+std::atomic<int64_t> g_lastFrameNs{0};
+
+void countFrame(int64_t t) {
+    static int64_t s_winStart = 0;
+    static int s_winFrames = 0;
+    if (s_winStart == 0) s_winStart = t;
+    ++s_winFrames;
+    if (t - s_winStart >= 500000000LL) {
+        g_gameFps.store(static_cast<float>(s_winFrames) * 1e9f / static_cast<float>(t - s_winStart),
+                        std::memory_order_relaxed);
+        s_winStart = t;
+        s_winFrames = 0;
+    }
+    g_lastFrameNs.store(t, std::memory_order_relaxed);
+}
+
 }  // namespace
+
+float gameFps() noexcept {
+    if (nowNs() - g_lastFrameNs.load(std::memory_order_relaxed) > 1000000000LL) return 0.0f;
+    return g_gameFps.load(std::memory_order_relaxed);
+}
 
 void setFpsCap(int fps) noexcept {
     const int old = g_requestedCap.exchange(fps);
@@ -101,7 +134,27 @@ int effectiveCap() noexcept {
 void setMainThread(pid_t tid) noexcept {
     g_mainTid.store(tid);
     ::hyperplay::prof::setMainThread(tid);
-    if (primePinEnabled()) static_cast<void>(scheduler().setPrimeRelaxed(tid, g_relax.load()));
+    if (cpuPin32Enabled()) {
+        static_cast<void>(scheduler().pinToPrimeCores(tid));
+    } else if (primePinEnabled()) {
+        static_cast<void>(scheduler().setPrimeRelaxed(tid, g_relax.load()));
+    }
+}
+
+void setRenderThread(pid_t tid) noexcept {
+    if (tid <= 0) return;
+    const pid_t prev = g_renderTid.exchange(tid);
+    if (prev != tid && cpuPin32Enabled()) {
+        static_cast<void>(scheduler().pinToPrimeCores(tid));
+    }
+}
+
+void setRenderWorkerThread(pid_t tid) noexcept {
+    if (tid <= 0) return;
+    const pid_t prev = g_workerTid.exchange(tid);
+    if (prev != tid && cpuPin32Enabled()) {
+        static_cast<void>(scheduler().pinToPerfCores(tid));
+    }
 }
 
 pid_t mainThread() noexcept { return g_mainTid.load(); }
@@ -155,8 +208,11 @@ void paceFrame() noexcept {
     const int hz = static_cast<int>(::hyperplay::win32::refreshHz());
     const int64_t target = 1000000000LL / (cap > 0 ? cap : (hz > 0 ? hz : 60)) * adpfMarginPct() / 100;
     if (s_lastWake != 0 && adpfEnabled()) {
-        const pid_t tids[2] = {g_mainTid.load(), static_cast<pid_t>(gettid())};
-        if (scheduler().ensureFrameSession(tids, 2, target)) {
+        const pid_t rtid = g_renderTid.load();
+        const pid_t wtid = g_workerTid.load();
+        const pid_t tids[3] = {g_mainTid.load(), rtid > 0 ? rtid : static_cast<pid_t>(gettid()), wtid};
+        const size_t n = wtid > 0 ? 3 : 2;
+        if (scheduler().ensureFrameSession(tids, n, target)) {
             scheduler().reportFrameWork(now - s_lastWake, target);
         }
     }
@@ -164,6 +220,7 @@ void paceFrame() noexcept {
     if (cap <= 0) {
         s_next = 0;
         s_lastWake = nowNs();
+        countFrame(s_lastWake);
         return;
     }
     const int64_t period = 1000000000LL / cap;
@@ -177,6 +234,7 @@ void paceFrame() noexcept {
     }
     s_next = next + period;
     s_lastWake = nowNs();
+    countFrame(s_lastWake);
 }
 
 }  // namespace hyperplay::pacing

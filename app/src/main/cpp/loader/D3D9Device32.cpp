@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -25,6 +26,7 @@
 #include <vector>
 
 #include "D3D9Probe32.h"
+#include "FramePacing.h"
 #include "gfx/D3D9GpuRenderer.h"
 #include "cpu/OryonEmitterBackend.h"
 #include "LowMem.h"
@@ -208,6 +210,7 @@ struct Resource : Obj {
     uint32_t priority = 0, lod = 0;
     uint64_t generation = 0;   // cambia en cada Unlock (subida a la GPU)
     std::vector<const uint8_t*> ptrs;  // datos por subrecurso para gpu9::TexRef
+    std::vector<uint32_t> ptrBytes;    // tamaño en bytes por subrecurso
 };
 
 struct Blob : Obj {  // shaders y declaraciones
@@ -235,6 +238,7 @@ struct Device : Obj {
     float vsF[256 * 4] = {}, psF[224 * 4] = {};
     int32_t vsI[16 * 4] = {}, psI[16 * 4] = {};
     u32 vsB[16] = {}, psB[16] = {};
+    uint64_t vsConstGen = 1, psConstGen = 1, rsGen = 1, ssGen = 1;
     u32 streams[16] = {}, streamOffset[16] = {}, streamStride[16] = {}, streamFreq[16] = {};
     u32 indices = 0, vdecl = 0, vs = 0, ps = 0, fvf = 0;
     uint8_t viewport[24] = {};
@@ -387,8 +391,13 @@ gpu9::TexRef texRef(Resource* r) {
     t.usage = owner->usage;
     t.generation = owner->generation;
     owner->ptrs.resize(owner->mips.size());
-    for (size_t i = 0; i < owner->mips.size(); ++i) owner->ptrs[i] = owner->mips[i].data;
+    owner->ptrBytes.resize(owner->mips.size());
+    for (size_t i = 0; i < owner->mips.size(); ++i) {
+        owner->ptrs[i] = owner->mips[i].data;
+        owner->ptrBytes[i] = owner->mips[i].bytes;
+    }
     t.data = owner->ptrs.data();
+    t.subresourceBytes = owner->ptrBytes.data();
     t.subresources = static_cast<uint32_t>(owner->ptrs.size());
     if (r->container != nullptr) {
         t.level = r->level;
@@ -424,6 +433,10 @@ void fillDrawState(Device* d, gpu9::DrawState& s) {
     }
     s.vsF = d->vsF; s.vsI = d->vsI; s.vsB = d->vsB;
     s.psF = d->psF; s.psI = d->psI; s.psB = d->psB;
+    s.vsConstGen = d->vsConstGen;
+    s.psConstGen = d->psConstGen;
+    s.rsGen = d->rsGen;
+    s.ssGen = d->ssGen;
     if (d->vdecl != 0) s.decl = static_cast<Blob*>(O(d->vdecl))->bytes.data();
     for (u32 i = 0; i < 16; ++i)
         if (d->streams[i] != 0) s.streams[i] = streamOf(static_cast<Resource*>(O(d->streams[i])), d->streamOffset[i],
@@ -737,6 +750,7 @@ u32 Dev_Reset(u32 t, u32 pp) {
     Device* d = D(t);
     if (pp == 0) return kInvalidCall;
     std::lock_guard<std::mutex> lk(d->mtx);
+    gpu9::Renderer::shared().sync();
     std::memcpy(d->pp, G<void>(pp), sizeof(d->pp));
     createBackBuffers(d);
     std::memcpy(G<void>(pp), d->pp, sizeof(d->pp));
@@ -744,13 +758,10 @@ u32 Dev_Reset(u32 t, u32 pp) {
     return kOk;
 }
 u32 present(Device* d) {
-    // Backbuffer a la pantalla por Vulkan; el ritmo de 60 Hz se mantiene aquí.
+    ::hyperplay::pacing::setRenderThread(static_cast<pid_t>(gettid()));
+    // Limitador preciso, tope de FPS (60/90/120), protección térmica, ADPF y pausa (Quick Resume).
+    ::hyperplay::pacing::paceFrame();
     gpu9::Renderer::shared().present(texRef(d->backBuffer));
-    using clock = std::chrono::steady_clock;
-    const auto now = clock::now();
-    if (d->nextFrame.time_since_epoch().count() == 0 || now > d->nextFrame + std::chrono::milliseconds(100)) d->nextFrame = now;
-    d->nextFrame += std::chrono::microseconds(16667);
-    std::this_thread::sleep_until(d->nextFrame);
     if ((++d->frames % 600) == 1) LOGI("Present #%llu", static_cast<unsigned long long>(d->frames));
     return kOk;
 }
@@ -839,11 +850,46 @@ u32 Dev_UpdateSurface(u32, u32 src, u32 srcRect, u32 dst, u32 dstPoint) {
     if (src == 0 || dst == 0) return kInvalidCall;
     Resource* s = R(src);
     Resource* d = R(dst);
-    if (srcRect != 0 || dstPoint != 0 || s->width != d->width || s->height != d->height) return kOk;  // parcial: sin soporte
     Resource* so = s->container ? static_cast<Resource*>(s->container) : s;
     Resource* dO = d->container ? static_cast<Resource*>(d->container) : d;
-    copyLevel(so, s->container ? s->face * so->levels + s->level : 0, dO, d->container ? d->face * dO->levels + d->level : 0,
-              s->width, s->height, 1);
+    {
+        char v[PROP_VALUE_MAX] = {};
+        if (__system_property_get("debug.hyperplay.d3d9vid", v) > 0 && v[0] == '1') {
+            LOGI("UpdateSurface %ux%u fmt=%u -> %ux%u fmt=%u srcRect=%u dstPt=%u",
+                 s->width, s->height, s->format, d->width, d->height, d->format, srcRect, dstPoint);
+        }
+    }
+    const u32 sIdx = s->container ? s->face * so->levels + s->level : 0;
+    const u32 dIdx = d->container ? d->face * dO->levels + d->level : 0;
+    if (srcRect == 0 && dstPoint == 0 && s->width == d->width && s->height == d->height) {
+        copyLevel(so, sIdx, dO, dIdx, s->width, s->height, 1);
+        ++dO->generation;
+        return kOk;
+    }
+    const int32_t sx0 = srcRect ? static_cast<int32_t>(rd32(srcRect)) : 0;
+    const int32_t sy0 = srcRect ? static_cast<int32_t>(rd32(srcRect + 4)) : 0;
+    const int32_t sx1 = srcRect ? static_cast<int32_t>(rd32(srcRect + 8)) : static_cast<int32_t>(s->width);
+    const int32_t sy1 = srcRect ? static_cast<int32_t>(rd32(srcRect + 12)) : static_cast<int32_t>(s->height);
+    const int32_t dx0 = dstPoint ? static_cast<int32_t>(rd32(dstPoint)) : 0;
+    const int32_t dy0 = dstPoint ? static_cast<int32_t>(rd32(dstPoint + 4)) : 0;
+    if (sx0 < 0 || sy0 < 0 || dx0 < 0 || dy0 < 0 || sx1 <= sx0 || sy1 <= sy0) return kOk;
+    const u32 cw = std::min(static_cast<u32>(sx1 - sx0), d->width - static_cast<u32>(dx0));
+    const u32 ch = std::min(static_cast<u32>(sy1 - sy0), d->height - static_cast<u32>(dy0));
+    Level* a = levelMem(so, sIdx, s->width, s->height, 1);
+    Level* b = levelMem(dO, dIdx, d->width, d->height, 1);
+    if (a == nullptr || b == nullptr) return kOk;
+    const FmtInfo fi = fmtInfo(s->format);
+    const u32 sp = rowPitch(s->format, s->width);
+    const u32 dp = rowPitch(d->format, d->width);
+    const u32 rows = std::max(1u, ch / fi.blockW);
+    const u32 rowBytes = std::max(1u, cw / fi.blockW) * fi.blockBytes;
+    const u32 sRow0 = static_cast<u32>(sy0) / fi.blockW;
+    const u32 dRow0 = static_cast<u32>(dy0) / fi.blockW;
+    const u32 sColB = (static_cast<u32>(sx0) / fi.blockW) * fi.blockBytes;
+    const u32 dColB = (static_cast<u32>(dx0) / fi.blockW) * fi.blockBytes;
+    for (u32 r = 0; r < rows; ++r) {
+        std::memcpy(b->data + (dRow0 + r) * dp + dColB, a->data + (sRow0 + r) * sp + sColB, rowBytes);
+    }
     ++dO->generation;
     return kOk;
 }
@@ -941,7 +987,17 @@ u32 Dev_LightEnable(u32, u32, u32) { return kOk; }
 u32 Dev_GetLightEnable(u32, u32, u32 p) { put32(p, 0); return kOk; }
 u32 Dev_SetClipPlane(u32 t, u32 i, u32 plane) { if (i < 6 && plane) std::memcpy(D(t)->clipPlanes[i], G<void>(plane), 16); return kOk; }
 u32 Dev_GetClipPlane(u32 t, u32 i, u32 plane) { if (i < 6 && plane) std::memcpy(G<void>(plane), D(t)->clipPlanes[i], 16); return kOk; }
-u32 Dev_SetRenderState(u32 t, u32 state, u32 value) { if (state < 256) D(t)->renderState[state] = value; return kOk; }
+u32 Dev_SetRenderState(u32 t, u32 state, u32 value) {
+    if (state < 256) {
+        Device* d = D(t);
+        u32& dst = d->renderState[state];
+        if (dst != value) {
+            dst = value;
+            ++d->rsGen;
+        }
+    }
+    return kOk;
+}
 u32 Dev_GetRenderState(u32 t, u32 state, u32 p) { put32(p, state < 256 ? D(t)->renderState[state] : 0); return kOk; }
 u32 Dev_CreateStateBlock(u32 t, u32, u32 pp) { Obj* o = make<Obj>(kStateBlock, D(t)); put32(pp, L(o)); return o ? kOk : kOutOfVideoMemory; }
 u32 Dev_BeginStateBlock(u32) { return kOk; }
@@ -960,7 +1016,8 @@ u32 stageIndex(u32 s) { return s >= 257 && s <= 260 ? 16 + (s - 257) : s; }
 u32 Dev_SetTexture(u32 t, u32 stage, u32 tex) {
     stage = stageIndex(stage);
     if (stage >= 20) return kInvalidCall;
-    setRef(D(t)->textures[stage], tex);
+    u32& slot = D(t)->textures[stage];
+    if (slot != tex) setRef(slot, tex);
     return kOk;
 }
 u32 Dev_GetTextureStageState(u32 t, u32 stage, u32 type, u32 p) { put32(p, stage < 8 && type < 33 ? D(t)->stageState[stage][type] : 0); return kOk; }
@@ -972,7 +1029,14 @@ u32 Dev_GetSamplerState(u32 t, u32 s, u32 type, u32 p) {
 }
 u32 Dev_SetSamplerState(u32 t, u32 s, u32 type, u32 v) {
     s = stageIndex(s);
-    if (s < 20 && type < 14) D(t)->samplerState[s][type] = v;
+    if (s < 20 && type < 14) {
+        Device* d = D(t);
+        u32& dst = d->samplerState[s][type];
+        if (dst != v) {
+            dst = v;
+            ++d->ssGen;
+        }
+    }
     return kOk;
 }
 u32 Dev_ValidateDevice(u32, u32 p) { put32(p, 1); return kOk; }
@@ -1099,10 +1163,10 @@ u32 makeShader(Device* d, u32 kind, u32 func, u32 pp) {
     return kOk;
 }
 u32 Dev_CreateVertexShader(u32 t, u32 func, u32 pp) { return makeShader(D(t), kVertexShader, func, pp); }
-u32 Dev_SetVertexShader(u32 t, u32 vs) { setRef(D(t)->vs, vs); return kOk; }
+u32 Dev_SetVertexShader(u32 t, u32 vs) { u32& s = D(t)->vs; if (s != vs) setRef(s, vs); return kOk; }
 u32 Dev_GetVertexShader(u32 t, u32 pp) { addRefG(D(t)->vs); put32(pp, D(t)->vs); return kOk; }
 u32 Dev_CreatePixelShader(u32 t, u32 func, u32 pp) { return makeShader(D(t), kPixelShader, func, pp); }
-u32 Dev_SetPixelShader(u32 t, u32 ps) { setRef(D(t)->ps, ps); return kOk; }
+u32 Dev_SetPixelShader(u32 t, u32 ps) { u32& s = D(t)->ps; if (s != ps) setRef(s, ps); return kOk; }
 u32 Dev_GetPixelShader(u32 t, u32 pp) { addRefG(D(t)->ps); put32(pp, D(t)->ps); return kOk; }
 
 template <typename T, size_t N>
@@ -1121,23 +1185,23 @@ u32 getConsts(T (&src)[N], u32 start, u32 data, u32 count, u32 perReg) {
     std::memcpy(G<void>(data), &src[first], std::min(n, N - first) * sizeof(T));
     return kOk;
 }
-u32 Dev_SetVSConstF(u32 t, u32 s, u32 d, u32 c) { return setConsts(D(t)->vsF, s, d, c, 4); }
+u32 Dev_SetVSConstF(u32 t, u32 s, u32 d, u32 c) { Device* dev = D(t); ++dev->vsConstGen; return setConsts(dev->vsF, s, d, c, 4); }
 u32 Dev_GetVSConstF(u32 t, u32 s, u32 d, u32 c) { return getConsts(D(t)->vsF, s, d, c, 4); }
-u32 Dev_SetVSConstI(u32 t, u32 s, u32 d, u32 c) { return setConsts(D(t)->vsI, s, d, c, 4); }
+u32 Dev_SetVSConstI(u32 t, u32 s, u32 d, u32 c) { Device* dev = D(t); ++dev->vsConstGen; return setConsts(dev->vsI, s, d, c, 4); }
 u32 Dev_GetVSConstI(u32 t, u32 s, u32 d, u32 c) { return getConsts(D(t)->vsI, s, d, c, 4); }
-u32 Dev_SetVSConstB(u32 t, u32 s, u32 d, u32 c) { return setConsts(D(t)->vsB, s, d, c, 1); }
+u32 Dev_SetVSConstB(u32 t, u32 s, u32 d, u32 c) { Device* dev = D(t); ++dev->vsConstGen; return setConsts(dev->vsB, s, d, c, 1); }
 u32 Dev_GetVSConstB(u32 t, u32 s, u32 d, u32 c) { return getConsts(D(t)->vsB, s, d, c, 1); }
-u32 Dev_SetPSConstF(u32 t, u32 s, u32 d, u32 c) { return setConsts(D(t)->psF, s, d, c, 4); }
+u32 Dev_SetPSConstF(u32 t, u32 s, u32 d, u32 c) { Device* dev = D(t); ++dev->psConstGen; return setConsts(dev->psF, s, d, c, 4); }
 u32 Dev_GetPSConstF(u32 t, u32 s, u32 d, u32 c) { return getConsts(D(t)->psF, s, d, c, 4); }
-u32 Dev_SetPSConstI(u32 t, u32 s, u32 d, u32 c) { return setConsts(D(t)->psI, s, d, c, 4); }
+u32 Dev_SetPSConstI(u32 t, u32 s, u32 d, u32 c) { Device* dev = D(t); ++dev->psConstGen; return setConsts(dev->psI, s, d, c, 4); }
 u32 Dev_GetPSConstI(u32 t, u32 s, u32 d, u32 c) { return getConsts(D(t)->psI, s, d, c, 4); }
-u32 Dev_SetPSConstB(u32 t, u32 s, u32 d, u32 c) { return setConsts(D(t)->psB, s, d, c, 1); }
+u32 Dev_SetPSConstB(u32 t, u32 s, u32 d, u32 c) { Device* dev = D(t); ++dev->psConstGen; return setConsts(dev->psB, s, d, c, 1); }
 u32 Dev_GetPSConstB(u32 t, u32 s, u32 d, u32 c) { return getConsts(D(t)->psB, s, d, c, 1); }
 
 u32 Dev_SetStreamSource(u32 t, u32 i, u32 vb, u32 off, u32 stride) {
     if (i >= 16) return kInvalidCall;
     Device* d = D(t);
-    setRef(d->streams[i], vb);
+    if (d->streams[i] != vb) setRef(d->streams[i], vb);
     d->streamOffset[i] = off;
     d->streamStride[i] = stride;
     return kOk;
@@ -1153,7 +1217,7 @@ u32 Dev_GetStreamSource(u32 t, u32 i, u32 pp, u32 pOff, u32 pStride) {
 }
 u32 Dev_SetStreamSourceFreq(u32 t, u32 i, u32 v) { if (i < 16) D(t)->streamFreq[i] = v; return kOk; }
 u32 Dev_GetStreamSourceFreq(u32 t, u32 i, u32 p) { put32(p, i < 16 ? D(t)->streamFreq[i] : 1); return kOk; }
-u32 Dev_SetIndices(u32 t, u32 ib) { setRef(D(t)->indices, ib); return kOk; }
+u32 Dev_SetIndices(u32 t, u32 ib) { u32& s = D(t)->indices; if (s != ib) setRef(s, ib); return kOk; }
 u32 Dev_GetIndices(u32 t, u32 pp) { addRefG(D(t)->indices); put32(pp, D(t)->indices); return kOk; }
 u32 Dev_DrawRectPatch(u32, u32, u32, u32) { return kNotImpl; }
 u32 Dev_DrawTriPatch(u32, u32, u32, u32) { return kNotImpl; }

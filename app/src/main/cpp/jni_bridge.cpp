@@ -465,6 +465,11 @@ HP_JNI(jfloat, nativeDirectPresentFps)(JNIEnv*, jclass) {
     return directGfx().presentFps();
 }
 
+// FPS reales del juego (llamadas a paceFrame), sin repeticiones ni sintéticos de HyperFG.
+HP_JNI(jfloat, nativeGameFps)(JNIEnv*, jclass) {
+    return hyperplay::pacing::gameFps();
+}
+
 HP_JNI(jlong, nativeDirectFramesPresented)(JNIEnv*, jclass) {
     return static_cast<jlong>(directGfx().totalFramesPresented());
 }

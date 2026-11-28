@@ -6,6 +6,7 @@
 #include <android/log.h>
 #include <sys/system_properties.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <ctime>
@@ -61,9 +62,9 @@ void rotationPc(VkSurfaceTransformFlagBitsKHR transform, float pc[8]) {
     X(vkCreateFramebuffer) X(vkDestroyFramebuffer) X(vkCreateCommandPool) X(vkDestroyCommandPool)                 \
     X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkResetCommandBuffer)             \
     X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkCmdPipelineBarrier)               \
-    X(vkCmdCopyImage) X(vkCmdFillBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants)   \
-    X(vkCmdDispatch) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdDraw) X(vkCmdSetViewport)              \
-    X(vkCmdSetScissor)
+    X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkCmdFillBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)      \
+    X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdDraw)           \
+    X(vkCmdSetViewport) X(vkCmdSetScissor)
 
 struct Fns {
 #define FG_DECL(name) PFN_##name name = nullptr;
@@ -99,7 +100,8 @@ struct HyperFrameGen::Impl {
 
     // Recursos por tamaño (al activar o al cambiar la resolución).
     VkFormat fmt = VK_FORMAT_UNDEFINED;
-    uint32_t w = 0, h = 0;
+    uint32_t w = 0, h = 0;      // resolución completa del backbuffer (hist, interp)
+    uint32_t fw = 0, fh = 0;    // resolución acotada <= 1600x900 solo para pirámide y flujo óptico
     bool sized = false;
     Img hist[2], lum[2][3], flow, interp;
     VkBuffer statsBuf = VK_NULL_HANDLE;
@@ -109,6 +111,8 @@ struct HyperFrameGen::Impl {
     uint64_t frame = 0;
     int validFrames = 0;
     int64_t lastRecordNs = 0;
+    int64_t emaIntervalNs = 0;
+    bool bypass = false;
 
     // Presentación del frame real (hilo HyperFG).
     VkFormat swapFmt = VK_FORMAT_UNDEFINED;
@@ -328,23 +332,31 @@ struct HyperFrameGen::Impl {
     }
 
     bool ensureSized(VkFormat format, uint32_t iw, uint32_t ih) {
-        if (sized && fmt == format && w == iw && h == ih) return true;
+        uint32_t nfw = iw, nfh = ih;
+        if (nfw > 1600u || nfh > 900u) {
+            const float s = std::min(1600.0f / static_cast<float>(nfw), 900.0f / static_cast<float>(nfh));
+            nfw = std::max(16u, (static_cast<uint32_t>(nfw * s) + 1u) & ~1u);
+            nfh = std::max(16u, (static_cast<uint32_t>(nfh * s) + 1u) & ~1u);
+        }
+        if (sized && fmt == format && w == iw && h == ih && fw == nfw && fh == nfh) return true;
         destroySized();
         fmt = format;
         w = iw;
         h = ih;
-        const uint32_t w2 = (iw + 1) / 2, h2 = (ih + 1) / 2, w4 = (w2 + 1) / 2, h4 = (h2 + 1) / 2,
+        fw = nfw;
+        fh = nfh;
+        const uint32_t w2 = (fw + 1) / 2, h2 = (fh + 1) / 2, w4 = (w2 + 1) / 2, h4 = (h2 + 1) / 2,
                        w8 = (w4 + 1) / 2, h8 = (h4 + 1) / 2;
         const VkImageUsageFlags lumUse = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         bool ok = true;
-        for (auto& hi : hist) ok = ok && makeImage(hi, format, iw, ih, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        for (auto& hi : hist) ok = ok && makeImage(hi, format, w, h, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
         for (auto& lv : lum) {
             ok = ok && makeImage(lv[0], VK_FORMAT_R16_SFLOAT, w2, h2, lumUse);
             ok = ok && makeImage(lv[1], VK_FORMAT_R16_SFLOAT, w4, h4, lumUse);
             ok = ok && makeImage(lv[2], VK_FORMAT_R16_SFLOAT, w8, h8, lumUse);
         }
         ok = ok && makeImage(flow, VK_FORMAT_R16G16_SFLOAT, w8, h8, lumUse);
-        ok = ok && makeImage(interp, VK_FORMAT_R8G8B8A8_UNORM, iw, ih, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+        ok = ok && makeImage(interp, VK_FORMAT_R8G8B8A8_UNORM, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                                                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         // Contadores del corte de escena (diffSum, count).
         if (ok) {
@@ -469,15 +481,16 @@ struct HyperFrameGen::Impl {
         if (gameFps <= 0 || !loadDevice() || !ensureSized(format, iw, ih)) return VK_NULL_HANDLE;
         const int cur = static_cast<int>(frame & 1u);  // el anterior (cur ^ 1) va en los descriptor sets
         {
-            // El frame real de hace dos ciclos lee hist[cur]: debe haberse enviado antes de pisarlo.
-            std::unique_lock<std::mutex> lk(m);
-            if ((hasJob || busy) && jobHist == cur) {
-                cv.wait_for(lk, std::chrono::milliseconds(4), [&] { return !hasJob && !busy; });
-                if (hasJob && jobHist == cur) {
-                    hasJob = false;  // no llegó a empezar: se descarta (raro)
-                    sCancelled.fetch_add(1, std::memory_order_relaxed);
-                }
-                cv.wait(lk, [&] { return !busy; });
+            // No bloquear nunca a RenderingThread: si el hilo HyperFG sigue presentando hist[cur],
+            // se omite este ciclo sin esperar.
+            std::lock_guard<std::mutex> lk(m);
+            if (busy && jobHist == cur) {
+                sCancelled.fetch_add(1, std::memory_order_relaxed);
+                return VK_NULL_HANDLE;
+            }
+            if (hasJob && jobHist == cur) {
+                hasJob = false;
+                sCancelled.fetch_add(1, std::memory_order_relaxed);
             }
         }
         const int64_t now = nowNs();
@@ -485,27 +498,50 @@ struct HyperFrameGen::Impl {
         // A 30 FPS reales (protección térmica con HyperFG) el periodo es de 33 ms: el umbral escala.
         const int64_t slowNs = std::max<int64_t>(kSlowFrameNs, 1320000000LL / gameFps);  // = FrameGenLogic.slowFrameMs
         const bool slow = lastRecordNs != 0 && now - lastRecordNs > slowNs;
+        if (lastRecordNs != 0) {
+            const int64_t dt = std::min<int64_t>(now - lastRecordNs, 200000000LL);  // ignora pausas largas
+            emaIntervalNs = emaIntervalNs == 0 ? dt : (emaIntervalNs * 7 + dt) / 8;
+        }
         lastRecordNs = now;
+        // Escudo 5 (histéresis): ritmo real sostenido por encima del umbral (GPU/CPU saturada, p. ej.
+        // d3d9-worker con CSMT) -> bypass total, sin copia ni cómputo: coste = fg=0. Sale bajo el 85 %.
+        if (!bypass && emaIntervalNs > slowNs) bypass = true;
+        else if (bypass && emaIntervalNs < slowNs * 85 / 100) bypass = false;
+        if (bypass && !repeatOnly) {
+            sSlow.fetch_add(1, std::memory_order_relaxed);
+            validFrames = 0;  // al salir, no interpolar con un historial viejo
+            return VK_NULL_HANDLE;
+        }
         const bool generate = validFrames >= 1 && !slow;
 
-        // 1. Copia en GPU del backbuffer al historial.
+        // 1. Copia (o reescala lineal si > 1600x900) en GPU del backbuffer al historial.
         VkImageMemoryBarrier sb{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        sb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        sb.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
         sb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         sb.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         sb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         sb.srcQueueFamilyIndex = sb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         sb.image = src;
         sb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        f.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+        f.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                                nullptr, 1, &sb);
         barrier(cmd, hist[cur], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-        VkImageCopy region{};
-        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.dstSubresource = region.srcSubresource;
-        region.extent = {iw, ih, 1};
-        f.vkCmdCopyImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hist[cur].image,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        if (w == iw && h == ih) {
+            VkImageCopy region{};
+            region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.dstSubresource = region.srcSubresource;
+            region.extent = {iw, ih, 1};
+            f.vkCmdCopyImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hist[cur].image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        } else {
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.srcOffsets[1] = {static_cast<int32_t>(iw), static_cast<int32_t>(ih), 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.dstOffsets[1] = {static_cast<int32_t>(w), static_cast<int32_t>(h), 1};
+            f.vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hist[cur].image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        }
         sb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         sb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         sb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -522,8 +558,15 @@ struct HyperFrameGen::Impl {
             sRepeat.fetch_add(1, std::memory_order_relaxed);
             return VK_NULL_HANDLE;
         }
+        if (slow) {
+            // Escudo 4: no pagar coste de cómputo (pirámide/flujo/interp) si el frame se va a omitir.
+            sSlow.fetch_add(1, std::memory_order_relaxed);
+            if (validFrames < 2) ++validFrames;
+            ++frame;
+            return VK_NULL_HANDLE;
+        }
 
-        // 2. Pirámide (y diferencia global para el corte de escena).
+        // 2. Pirámide (y diferencia global para el corte de escena) a resolución acotada (<= 1600x900).
         for (auto& lv : lum)
             for (auto& li : lv)
                 if (li.layout != VK_IMAGE_LAYOUT_GENERAL)
@@ -535,7 +578,7 @@ struct HyperFrameGen::Impl {
         f.vkCmdFillBuffer(cmd, statsBuf, 0, 16, 0);
         memoryBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        struct { float invW, invH; uint32_t hasPrev; } ppc{1.0f / static_cast<float>(iw), 1.0f / static_cast<float>(ih),
+        struct { float invW, invH; uint32_t hasPrev; } ppc{1.0f / static_cast<float>(fw), 1.0f / static_cast<float>(fh),
                                                             validFrames >= 1 ? 1u : 0u};
         f.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pyrPipe);
         f.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pyrPl, 0, 1, &pyrSet[cur], 0, nullptr);
@@ -551,17 +594,15 @@ struct HyperFrameGen::Impl {
             memoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
             // 4. Interpolación t = 0.5 con los escudos.
             barrier(cmd, interp, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
-            struct { float invW, invH, st, conf, cut; } ipc{1.0f / static_cast<float>(iw), 1.0f / static_cast<float>(ih),
+            struct { float invW, invH, st, conf, cut; } ipc{1.0f / static_cast<float>(w), 1.0f / static_cast<float>(h),
                                                              kStaticThr, kConfThr, kCutThr};
             f.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, interpPipe);
             f.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, interpPl, 0, 1, &interpSet[cur], 0, nullptr);
             f.vkCmdPushConstants(cmd, interpPl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ipc), &ipc);
-            f.vkCmdDispatch(cmd, (iw + 7) / 8, (ih + 7) / 8, 1);
+            f.vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
             barrier(cmd, interp, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                     VK_ACCESS_SHADER_READ_BIT);
             sGenerated.fetch_add(1, std::memory_order_relaxed);
-        } else if (slow) {
-            sSlow.fetch_add(1, std::memory_order_relaxed);
         }
         if (validFrames < 2) ++validFrames;
         ++frame;
@@ -748,7 +789,7 @@ struct HyperFrameGen::Impl {
             b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             b.image = t.image;
             b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            f.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+            f.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
                                    nullptr, 0, nullptr, 1, &b);
             f.vkEndCommandBuffer(cmd);
         }
@@ -850,6 +891,8 @@ void HyperFrameGen::releaseIfIdle() {
     Impl& i = impl();
     if (i.sized) i.destroySized();
     i.lastRecordNs = 0;
+    i.emaIntervalNs = 0;
+    i.bypass = false;
 }
 
 HyperFrameGen::Stats HyperFrameGen::stats() const noexcept {

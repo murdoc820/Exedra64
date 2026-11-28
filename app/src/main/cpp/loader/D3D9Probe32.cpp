@@ -10,6 +10,7 @@
 
 #include <android/log.h>
 #include <sys/mman.h>
+#include <sys/system_properties.h>
 
 #include <atomic>
 #include <cstring>
@@ -49,6 +50,14 @@ struct Mode { u32 w, h; };
 std::vector<Mode> modes() {
     std::vector<Mode> m;
     m.push_back({g_display.width, g_display.height});
+    if (g_display.width > 1920 && g_display.height > 860) {
+        const u32 h75 = ((g_display.height * 3 / 4) + 1) & ~1u;
+        const u32 w75 = ((g_display.width * 3 / 4) + 1) & ~1u;
+        const u32 h60 = ((g_display.height * 3 / 5) + 1) & ~1u;
+        const u32 w60 = ((g_display.width * 3 / 5) + 1) & ~1u;
+        m.push_back({w75, h75});
+        m.push_back({w60, h60});
+    }
     for (const Mode x : {Mode{1920, 1080}, Mode{1600, 900}, Mode{1280, 720}}) {
         if (x.w != g_display.width || x.h != g_display.height) m.push_back(x);
     }
@@ -101,7 +110,14 @@ u32 GetAdapterDisplayMode(u32, u32 adapter, u32 out) {
     return kOk;
 }
 u32 CheckDeviceType(u32, u32 adapter, u32, u32, u32, u32) { return adapter == 0 ? kOk : kInvalidCall; }
-u32 CheckDeviceFormat(u32, u32 adapter, u32, u32, u32, u32, u32) { return adapter == 0 ? kOk : kInvalidCall; }
+u32 CheckDeviceFormat(u32, u32 adapter, u32, u32, u32 usage, u32, u32 fmt) {
+    if (adapter != 0) return kInvalidCall;
+    // Formatos YUV empaquetados (UYVY, YUY2, NV12) no soportados en Vulkan D3D9: fuerza fallback a L8/RGBA.
+    if (fmt == 0x59565955u || fmt == 0x32595559u || fmt == 0x3231564Eu) return kNotAvailable;
+    // D3DFMT_L8 (50) no es RenderTarget válido en D3D9.
+    if (fmt == 50u && (usage & 1u) != 0) return kNotAvailable;
+    return kOk;
+}
 u32 CheckDeviceMultiSampleType(u32, u32 adapter, u32, u32, u32, u32 type, u32 quality) {
     if (adapter != 0) return kInvalidCall;
     if (quality != 0) { const u32 q = 1; std::memcpy(P(quality), &q, 4); }

@@ -215,7 +215,7 @@ void dumpReport(int seconds) {
                  100.0 * static_cast<double>(tg[i].first) / static_cast<double>(topT[t].first),
                  static_cast<unsigned long long>(tg[i].second));
         }
-        for (size_t i = 0; i < th.size() && i < 15; ++i) {
+        for (size_t i = 0; i < th.size() && i < 20; ++i) {
             PLOG("tN %6llu %5.2f%% %s", static_cast<unsigned long long>(th[i].first),
                  100.0 * static_cast<double>(th[i].first) / static_cast<double>(topT[t].first), th[i].second.c_str());
         }

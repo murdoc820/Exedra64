@@ -3,8 +3,12 @@
 #include <sys/system_properties.h>
 
 #include <android/log.h>
+#include <dlfcn.h>
 #include <time.h>
 #include <vulkan/vulkan_android.h>
+
+#include "HyperFrameGen.h"
+#include "loader/Win32DisplayInfo.h"
 
 #include <algorithm>
 #include <cstring>
@@ -409,8 +413,10 @@ bool DirectVulkanBridge::createSwapchain() {
     // descarta frames) solo con `setprop debug.hyperplay.mailbox 1`, para medir el techo de FPS.
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
     char mailboxProp[PROP_VALUE_MAX] = {};
+    const bool autoMailbox144 = ::hyperplay::win32::refreshHz() >= 120;
     const bool wantMailbox =
-        __system_property_get("debug.hyperplay.mailbox", mailboxProp) > 0 && mailboxProp[0] == '1';
+        (__system_property_get("debug.hyperplay.mailbox", mailboxProp) > 0 && mailboxProp[0] == '1') ||
+        (autoMailbox144 && !(mailboxProp[0] == '0'));
     for (VkPresentModeKHR mode : presentModes) {
         if (wantMailbox && mode == VK_PRESENT_MODE_MAILBOX_KHR) {
             presentMode = mode;
@@ -509,6 +515,14 @@ bool DirectVulkanBridge::createSwapchain() {
     }
 
     ++swapchainGeneration_;
+    using SetFrameRateFn = int32_t (*)(ANativeWindow*, float, int8_t, int8_t);
+    static auto setFrameRateFn = reinterpret_cast<SetFrameRateFn>(
+        dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRateWithChangeStrategy"));
+    if (setFrameRateFn != nullptr && window_ != nullptr) {
+        const float targetHz = gpu::HyperFrameGen::enabled() ? 120.0f : 60.0f;
+        setFrameRateFn(window_, targetHz, 1 /* FIXED_SOURCE */, 0 /* ONLY_IF_SEAMLESS */);
+        LOGI("ANativeWindow_setFrameRate -> %.0f Hz", targetHz);
+    }
     LOGI("Swapchain %ux%u formato %d alpha %d modo %d (%u imágenes) transform=0x%x transferDst=%d",
          swapchainExtent_.width, swapchainExtent_.height, static_cast<int>(swapchainFormat_),
          static_cast<int>(swapInfo.compositeAlpha), static_cast<int>(presentMode),

@@ -574,11 +574,12 @@ private:
     bool lastExitDynamic_ = false;
     // call [IAT] hacia una función nativa de la lista rápida: BLR directo desde el bloque.
     void emitX87Call(uint8_t op, uint8_t modrm, bool hasEa);
+    bool emitX87Native(uint8_t op, uint8_t modrm, bool mem);
     void emitProbeCall(uintptr_t rip);
     void emitFastNativeCall(uintptr_t fn, bool blocking, uintptr_t nextRip, bool tailCall = false,
                             uintptr_t iatSlot = 0);
     void emitFastNativeCall32(uintptr_t fn, bool blocking, uintptr_t nextRip, uint32_t slots);
-    void emitFastIndirect32(uintptr_t nextRip);
+    void emitFastIndirect32(uintptr_t nextRip, bool tailCall = false);
 
 public:
     /// Función nativa (wrapper Win32 de HyperPlay) que el JIT puede llamar directamente desde el
@@ -599,6 +600,13 @@ public:
     // la llamada nativa completa; devuelve 0 si se sigue en la instrucción siguiente.
     static std::atomic<uintptr_t> fast32AliasBase;
     static std::atomic<uint32_t (*)(CpuContext*, uint32_t, uint32_t)> fast32Indirect;
+    struct Fast32AliasEntry {
+        uintptr_t hostFn;
+        uint8_t slots;
+        uint8_t blocking;
+        uint8_t pad[6];
+    };
+    static std::atomic<const Fast32AliasEntry*> fast32Table;
 
 private:
     void linkExit(uint64_t site, const void* targetHost, uintptr_t targetRip);
@@ -639,6 +647,9 @@ private:
     // DeadExit: salida directa a un destino que sobrescribe los flags sin leerlos.
     enum class FlagEventKind : uint8_t { Write, Read, DeadExit };
     uintptr_t curBlockRip_ = 0;  // RIP de inicio del bloque que se está traduciendo
+    uintptr_t stitchTarget_ = 0;
+    uintptr_t stitchLimit_ = 0;
+    int stitchBudget_ = 0;
     struct FlagEvent {
         FlagEventKind kind;
         size_t start, end;  // palabras [start, end) de la escritura

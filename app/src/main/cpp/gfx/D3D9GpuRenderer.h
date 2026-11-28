@@ -25,6 +25,7 @@ struct TexRef {
     uint32_t usage = 0;             // D3DUSAGE (1 RENDERTARGET, 2 DEPTHSTENCIL)
     uint64_t generation = 0;        // cambia en cada Unlock de la CPU
     const uint8_t* const* data = nullptr;  // por subrecurso (cara * levels + nivel); entradas nulas = sin datos
+    const uint32_t* subresourceBytes = nullptr;  // tamaño en bytes por subrecurso (para snapshot asíncrono)
     uint32_t subresources = 0;
     uint32_t level = 0, face = 0;   // subrecurso usado como destino
     bool valid() const { return key != nullptr; }
@@ -52,6 +53,10 @@ struct DrawState {
     const float* psF = nullptr;     // 224 * 4
     const int32_t* psI = nullptr;
     const uint32_t* psB = nullptr;
+    uint64_t vsConstGen = 0;
+    uint64_t psConstGen = 0;
+    uint64_t rsGen = 0;
+    uint64_t ssGen = 0;
     const uint8_t* decl = nullptr;  // D3DVERTEXELEMENT9[] (8 bytes) hasta D3DDECL_END
     Stream streams[16];
     Stream indices;
@@ -85,6 +90,7 @@ public:
     void colorFill(const TexRef& dst, const int32_t* rect, uint32_t color);
     bool present(const TexRef& backbuffer);
     void release(const void* key);
+    void sync();
 
     struct Stats {
         uint64_t draws = 0, failedDraws = 0, pipelines = 0, uploads = 0, presents = 0, clears = 0;

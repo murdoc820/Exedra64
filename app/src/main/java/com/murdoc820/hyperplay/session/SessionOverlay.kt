@@ -43,6 +43,7 @@ import androidx.compose.ui.res.stringArrayResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import com.murdoc820.hyperplay.R
+import kotlin.math.roundToInt
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -96,6 +97,8 @@ class SessionUiState {
     var killing by mutableStateOf(false)
 
     var presentFps by mutableFloatStateOf(0f)
+    /** FPS reales del juego (llamadas a Present), sin repeticiones ni sintéticos de HyperFG. */
+    var gameFps by mutableFloatStateOf(0f)
     var receivedFps by mutableFloatStateOf(0f)
     var fsrUpscale by mutableStateOf(true)
     var notice by mutableStateOf<String?>(null)
@@ -137,7 +140,8 @@ fun SessionOverlay(
             SessionPhase.RUNNING -> PerfOverlay(
                 state.perfMode, state.perf,
                 hud = HudContext(
-                    targetFps = FrameGenLogic.presentedFps(FrameGenLogic.gameFps(state.thermal, state.frameGen), state.frameGen),
+                    // El OSD muestra FPS reales del juego: se comparan con el tope real (sin x2 de HyperFG).
+                    targetFps = FrameGenLogic.gameFps(state.thermal, state.frameGen),
                     thermal = state.thermal,
                     frameGen = state.frameGen,
                 ),
@@ -333,8 +337,9 @@ private fun ActionsPane(
 /** Estado en vivo con puntos de color y texto (no solo color). */
 @Composable
 private fun LiveStatus(state: SessionUiState) {
-    val target = FrameGenLogic.presentedFps(FrameGenLogic.gameFps(state.thermal, state.frameGen), state.frameGen)
-    val fps = state.presentFps
+    // Tope real del juego (no el presentado) y FPS reales; si aún no hay muestra, cae al presentado.
+    val target = FrameGenLogic.gameFps(state.thermal, state.frameGen)
+    val fps = if (state.gameFps > 0f) state.gameFps else state.presentFps
     // Mismos umbrales de jugabilidad que el overlay de rendimiento (rojo solo por debajo de lo jugable).
     val fpsColor = when (PerfMonitorLogic.fpsLevel(fps.toFloat(), target)) {
         PerfLevel.BAD -> Mac.Red
@@ -342,6 +347,9 @@ private fun LiveStatus(state: SessionUiState) {
         else -> Mac.Green
     }
     StatusLine(fpsColor, if (target > 0) stringResource(R.string.fps_of, fps, target) else stringResource(R.string.fps_now, fps))
+    if (state.frameGen && state.presentFps > 0f) {
+        StatusLine(fpsColor, "HyperFG → ${state.presentFps.roundToInt()}")
+    }
     val bat = state.perf.batteryTempC
     if (bat != null) {
         val c = when {

@@ -8,8 +8,19 @@ sección de la versión etiquetada en las notas de la Release de GitHub.
 
 ## Unreleased
 
+## 1.3.0-beta
+
 ### English
 
+- **Overlay shows the game's real FPS.** The HUD and OSD counted swapchain presents, inflated by frame repetition (a
+  60 FPS cap on the 120 Hz panel presents each frame twice) and HyperFG synthetic frames, so a 60 FPS cap looked like
+  ~120 and HyperFG on/off looked the same. They now count the game's own `Present` calls; with HyperFG a second line
+  shows the presented rate.
+- **HyperFG: hysteresis bypass.** When the real frame rate stays slower than the threshold, frame generation turns fully
+  off (no history copy, no compute), so HyperFG never costs more than leaving it off. It comes back below 85 % of the
+  threshold.
+- **Direct3D 9 (DmC): graphical glitches fixed.** Static vertex/index buffer uploads no longer break the Vulkan render
+  pass mid-frame; the draw reads from the upload ring and the device-local copy happens outside the pass.
 - **32-bit games: DmC now reaches gameplay.** Windows-correct mutexes (owner + recursion; Bink deadlocked on the opening
   credits), `TlsFree` clears the slot for every thread (PhysX reused stale TLS objects), `ExitThread` really ends 32-bit
   threads, low (below 4 GB) memory gaps are found from `/proc/self/maps` and small Direct3D 9 allocations share pooled
@@ -87,6 +98,16 @@ sección de la versión etiquetada en las notas de la Release de GitHub.
 
 ### Español
 
+- **El overlay muestra los FPS reales del juego.** El HUD y el OSD contaban las presentaciones del swapchain, infladas
+  por la repetición de frames (un tope de 60 FPS en el panel de 120 Hz presenta cada frame dos veces) y por los frames
+  sintéticos de HyperFG: con tope 60 se veían ~120 y HyperFG encendido o apagado se veía igual. Ahora cuentan las
+  llamadas `Present` del propio juego; con HyperFG una segunda línea muestra lo presentado.
+- **HyperFG: bypass con histéresis.** Si el ritmo real se mantiene más lento que el umbral, la generación se apaga del
+  todo (sin copia al historial ni cómputo), así que HyperFG nunca cuesta más que tenerlo apagado. Vuelve bajo el 85 %
+  del umbral.
+- **Direct3D 9 (DmC): errores gráficos corregidos.** Las subidas de búferes de vértices/índices estáticos ya no cortan el
+  render pass de Vulkan a mitad de frame; el draw lee del anillo de subida y la copia a memoria de GPU se hace fuera del
+  pase.
 - **Juegos de 32 bits: DmC ya llega a la partida.** Mutex como en Windows (dueño y recursión; Bink se bloqueaba en los créditos
   iniciales), `TlsFree` vacía la ranura en todos los hilos (PhysX reutilizaba objetos TLS viejos), `ExitThread` termina de verdad
   los hilos de 32 bits, los huecos de memoria por debajo de 4 GB se buscan en `/proc/self/maps` y las reservas pequeñas de

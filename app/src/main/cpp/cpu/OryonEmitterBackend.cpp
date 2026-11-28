@@ -368,6 +368,9 @@ double arith(unsigned sub, double a, double b) {
 }
 
 std::atomic<uint32_t> s_unknownLogged{0};
+std::atomic<uint64_t> s_fallbackCalls{0};
+std::atomic<uint32_t> s_fallbackHist[8 * 256]{};
+
 void logUnknown(unsigned op, unsigned modrm) {
     if (s_unknownLogged.fetch_add(1) < 32) {
         __android_log_print(ANDROID_LOG_WARN, "HyperPlay.OryonEmitter", "x87 no implementada: %02X %02X", op, modrm);
@@ -378,6 +381,10 @@ void logUnknown(unsigned op, unsigned modrm) {
 
 uint64_t executeX87(CpuContext* c, uint32_t op, uint32_t modrm, uintptr_t ea) {
     using namespace x87;
+    s_fallbackCalls.fetch_add(1, std::memory_order_relaxed);
+    if (op >= 0xD8u && op <= 0xDFu) {
+        s_fallbackHist[((op - 0xD8u) << 8) | (modrm & 0xFFu)].fetch_add(1, std::memory_order_relaxed);
+    }
     const unsigned sub = (modrm >> 3) & 7u;
     const bool reg = (modrm & 0xC0u) == 0xC0u;
     const unsigned i = modrm & 7u;
@@ -2774,11 +2781,76 @@ bool OryonEmitterBackend::lookupFastNative(uintptr_t fn, bool& blocking) {
 
 std::atomic<uintptr_t> OryonEmitterBackend::fast32AliasBase{0};
 std::atomic<uint32_t (*)(CpuContext*, uint32_t, uint32_t)> OryonEmitterBackend::fast32Indirect{nullptr};
+std::atomic<const OryonEmitterBackend::Fast32AliasEntry*> OryonEmitterBackend::fast32Table{nullptr};
 
-// CALL indirecto de 32 bits a la zona de alias (W16 = destino): guarda el estado invitado en ctx, llama a
-// fast32Indirect(ctx, destino, siguiente) con el hilo marcado "en nativo" (puede esperar), recarga el estado y, si
-// la función nativa cambió el flujo (devuelve != 0: RIP ya en ctx) o se pidió suspender, sale al despachador.
-void OryonEmitterBackend::emitFastIndirect32(uintptr_t nextRip) {
+// CALL indirecto de 32 bits a la zona de alias (W16 = destino): si fast32Table tiene una entrada
+// stdcall no bloqueante (0..8 args), la llama directo desde ARM64 sin guardar XMM/GPRs ni pasar por
+// dispatchThunk; si no, guarda el estado invitado en ctx y llama a fast32Indirect.
+void OryonEmitterBackend::emitFastIndirect32(uintptr_t nextRip, bool tailCall) {
+    const Fast32AliasEntry* tbl = fast32Table.load(std::memory_order_relaxed);
+    size_t bDoneFast = 0;
+    size_t cbzSlow = 0, tbnzSlow = 0;
+    if (tbl != nullptr) {
+        const auto ldpW = [&](uint8_t rt1, uint8_t rt2, uint8_t rn, uint32_t byteOff) {
+            const uint32_t imm7 = (byteOff / 4u) & 0x7Fu;
+            emitWord(0x29400000u | (imm7 << 15) | (static_cast<uint32_t>(rt2) << 10) |
+                     (static_cast<uint32_t>(rn) << 5) | rt1);
+        };
+        // W17 = destino - base; idx = (W17 >> 4) & 0xFFFF
+        emitWord(0xD3400000u | (1u << 22) | (4u << 16) | (19u << 10) | (17u << 5) | 17u);
+        emitMovHostAddr(20, reinterpret_cast<uintptr_t>(tbl), kJitRelocLib);
+        emitWord(0x8B000000u | (17u << 16) | (4u << 10) | (20u << 5) | 20u);  // ADD X20, X20, X17, LSL #4
+        emitLdpX(21, 22, 20, 0);  // X21 = hostFn, W22 = slots | (blocking << 8)
+        cbzSlow = wordPos();
+        emitWord(0);  // CBZ X21, slow
+        tbnzSlow = wordPos();
+        emitWord(0);  // TBNZ W22, #8, slow
+        if (tailCall) {
+            emitWord(0xB9400097u);  // LDR W23, [X4, #0] (retAddr de la pila; X23 callee-saved)
+        }
+        // Vía rápida directa ARM64: solo preserva callee-saved Win32 (EBX..EDI = X3..X7).
+        emitStrX(3, 19, 24);
+        emitStpX(4, 5, 19, 32);
+        emitStpX(6, 7, 19, 48);
+        if (tailCall) {
+            emitAddImm(17, 4, 4, true, false);  // X17 = ESP + 4 (primer argumento)
+        } else {
+            emitMovReg(17, 4, true);            // X17 = ESP
+        }
+        ldpW(0, 1, 17, 0);
+        ldpW(2, 3, 17, 8);
+        emitWord(0x710012DFu);  // CMP W22, #4
+        const size_t blsSkip = wordPos();
+        emitWord(0);            // B.LS skip4_7
+        ldpW(4, 5, 17, 16);
+        ldpW(6, 7, 17, 24);
+        patchWord(blsSkip, 0x54000000u | (static_cast<uint32_t>(wordPos() - blsSkip) << 5) | 0x9u);
+        emitStpPre(29, 30, 31, -2);
+        emitBlr(21);
+        emitLdpPost(29, 30, 31, 2);
+        emitMovReg(0, 0, false);  // EAX = W0
+        emitLdrX(3, 19, 24);
+        emitLdpX(4, 5, 19, 32);
+        emitLdpX(6, 7, 19, 48);
+        if (tailCall) {
+            emitAddImm(4, 4, 4, true, false);  // pop retAddr
+        }
+        emitWord(0x8B200000u | (22u << 16) | (2u << 13) | (2u << 10) | (4u << 5) | 4u);  // ADD X4, X4, W22, UXTW #2
+        if (tailCall) {
+            emitStrX(23, 19, static_cast<int32_t>(offsetof(CpuContext, rip)));
+            flagEvents_.push_back({FlagEventKind::Read, 0, 0});
+            lastExitDynamic_ = true;
+            pendingExits_.push_back({wordPos(), false, false});
+            emitWord(0x14000000u);  // B epílogo / inlineDispatch
+            patchWord(cbzSlow, 0xB4000000u | (static_cast<uint32_t>(wordPos() - cbzSlow) << 5) | 21u);
+            patchWord(tbnzSlow, 0x37400000u | (static_cast<uint32_t>(wordPos() - tbnzSlow) << 5) | 22u);
+            return;
+        }
+        bDoneFast = wordPos();
+        emitWord(0);  // B suspendCheck
+        patchWord(cbzSlow, 0xB4000000u | (static_cast<uint32_t>(wordPos() - cbzSlow) << 5) | 21u);
+        patchWord(tbnzSlow, 0x37400000u | (static_cast<uint32_t>(wordPos() - tbnzSlow) << 5) | 22u);
+    }
     const int32_t simdOffset = static_cast<int32_t>(offsetof(CpuContext, simd));
     for (uint8_t i = 0; i < 8; ++i) {
         emitStrQ(i, 19, simdOffset + static_cast<int32_t>(i * 16));
@@ -2815,6 +2887,9 @@ void OryonEmitterBackend::emitFastIndirect32(uintptr_t nextRip) {
     pendingExits_.push_back({wordPos(), false, false});
     emitWord(0x14000000u);  // B epílogo
     patchImm19(cont, wordPos());
+    if (tbl != nullptr) {
+        patchWord(bDoneFast, 0x14000000u | static_cast<uint32_t>(wordPos() - bDoneFast));
+    }
     // ¿Suspensión pedida mientras estaba en nativo?
     emitCtxRelAddr(16, &suspendCount_);
     emitWord(0x88DFFE10u);  // LDAR W16, [X16]
@@ -3142,6 +3217,24 @@ static void probeLog(CpuContext* c, uint64_t rip) {
          static_cast<unsigned long long>(c->gpr[15]));
 }
 
+namespace {
+void x87Fsin(CpuContext* c) {
+    c->x87[c->x87Top & 7u] = std::sin(c->x87[c->x87Top & 7u]);
+    c->x87Sw &= static_cast<uint16_t>(~(1u << 10));  // C2 = 0
+}
+void x87Fcos(CpuContext* c) {
+    c->x87[c->x87Top & 7u] = std::cos(c->x87[c->x87Top & 7u]);
+    c->x87Sw &= static_cast<uint16_t>(~(1u << 10));  // C2 = 0
+}
+void x87Fpatan(CpuContext* c) {
+    const uint32_t t0 = c->x87Top & 7u;
+    const uint32_t t1 = (c->x87Top + 1u) & 7u;
+    c->x87[t1] = std::atan2(c->x87[t1], c->x87[t0]);
+    c->x87Tag &= static_cast<uint16_t>(~(1u << t0));
+    c->x87Top = t1;
+}
+}  // namespace
+
 void OryonEmitterBackend::emitProbeCall(uintptr_t rip) {
     const int32_t nzcvOffset = static_cast<int32_t>(offsetof(CpuContext, nzcv));
     const int32_t simdOffset = static_cast<int32_t>(offsetof(CpuContext, simd));
@@ -3174,6 +3267,566 @@ void OryonEmitterBackend::emitProbeCall(uintptr_t rip) {
 // Instrucción x87: guarda el estado invitado (GPR y XMM en ctx, NZCV en ctx.nzcv porque la
 // llamada a C lo destruye), llama a executeX87(ctx, op, modrm, ea = X16 si hay memoria) y lo
 // recarga. No sale al despachador (salvo FCOMI, que lo decide quien llama).
+// x87 en línea (sin llamar al intérprete): FLD/FST/FSTP m32/m64, FADD/FMUL/FSUB(R)/FDIV(R) con m32/m64 y con la
+// pila (D8/DC/DE), FLD ST(i) y FXCH. Mismo estado que executeX87 (ctx->x87 en doble, x87Top, x87Tag) y misma
+// aritmética (doble con el redondeo del FPCR). Antes cada instrucción guardaba y restauraba todo el estado invitado
+// (~80 instrucciones) para llamar al intérprete: PhysX de DmC ejecuta millones por segundo. Usa X16 (EA), X17,
+// X20..X23, D30 y D31 como temporales. setprop debug.hyperplay.x87native 0 lo desactiva.
+bool OryonEmitterBackend::emitX87Native(uint8_t op, uint8_t modrm, bool mem) {
+    static const bool s_on = [] {
+        char v[PROP_VALUE_MAX] = {};
+        return !(__system_property_get("debug.hyperplay.x87native", v) > 0 && v[0] == '0');
+    }();
+    if (!s_on) return false;
+    const unsigned sub = (modrm >> 3) & 7u, i = modrm & 7u;
+    const int32_t offTop = static_cast<int32_t>(offsetof(CpuContext, x87Top));
+    const int32_t offTag = static_cast<int32_t>(offsetof(CpuContext, x87Tag));
+    const int32_t offSw = static_cast<int32_t>(offsetof(CpuContext, x87Sw));
+    const int32_t offCw = static_cast<int32_t>(offsetof(CpuContext, x87Cw));
+    const int32_t offSt = static_cast<int32_t>(offsetof(CpuContext, x87));
+    if ((offSt % 8) != 0 || offSt / 8 > 4095 || (offSw % 2) != 0 || offSw / 2 > 4095 ||
+        (offCw % 2) != 0 || offCw / 2 > 4095) {
+        return false;
+    }
+    const auto andW7 = [&](uint8_t r) { emitWord(0x12000800u | (static_cast<uint32_t>(r) << 5) | r); };  // AND Wr, Wr, #7
+    const auto ldD = [&](uint8_t d, uint8_t base, int32_t off) {
+        emitWord(0xFD400000u | (static_cast<uint32_t>(off / 8) << 10) | (static_cast<uint32_t>(base) << 5) | d);
+    };
+    const auto stD = [&](uint8_t d, uint8_t base, int32_t off) {
+        emitWord(0xFD000000u | (static_cast<uint32_t>(off / 8) << 10) | (static_cast<uint32_t>(base) << 5) | d);
+    };
+    const auto ldH = [&](uint8_t rt, uint8_t base, int32_t off) {
+        emitWord(0x79400000u | (static_cast<uint32_t>(off / 2) << 10) | (static_cast<uint32_t>(base) << 5) | rt);
+    };
+    const auto stH = [&](uint8_t rt, uint8_t base, int32_t off) {
+        emitWord(0x79000000u | (static_cast<uint32_t>(off / 2) << 10) | (static_cast<uint32_t>(base) << 5) | rt);
+    };
+    const auto cselW = [&](uint8_t rd, uint8_t rn, uint8_t rm, uint8_t cond) {
+        emitWord(0x1A800000u | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(cond) << 12) |
+                 (static_cast<uint32_t>(rn) << 5) | rd);
+    };
+    // Xr = ctx + 8 * ((top + k) & 7): luego [Xr + offSt] es ST(k).
+    const auto stAddr = [&](uint8_t r, unsigned k) {
+        emitLdrW(r, 19, offTop);
+        if (k != 0) emitAddImm(r, r, static_cast<uint16_t>(k), false);
+        andW7(r);
+        emitAddRegShift(r, 19, r, 3, true);
+    };
+    const auto bitW22 = [&] {  // W22 = 1 << W17
+        emitMovImm64(22, 1);
+        emitWord(0x1AC02000u | (17u << 16) | (22u << 5) | 22u);  // LSLV W22, W22, W17
+    };
+    const auto push = [&](uint8_t d) {
+        emitLdrW(17, 19, offTop);
+        emitSubImm(17, 17, 1, false);
+        andW7(17);
+        emitStrW(17, 19, offTop);
+        bitW22();
+        emitLdrW(16, 19, offTag);
+        emitWord(0x2A000000u | (22u << 16) | (16u << 5) | 16u);  // ORR W16, W16, W22
+        emitStrW(16, 19, offTag);
+        emitAddRegShift(17, 19, 17, 3, true);
+        stD(d, 17, offSt);
+    };
+    const auto pop = [&] {
+        emitLdrW(17, 19, offTop);
+        bitW22();
+        emitLdrW(16, 19, offTag);
+        emitWord(0x0A200000u | (22u << 16) | (16u << 5) | 16u);  // BIC W16, W16, W22
+        emitStrW(16, 19, offTag);
+        emitAddImm(17, 17, 1, false);
+        andW7(17);
+        emitStrW(17, 19, offTop);
+    };
+    // Compara D30 con D31 y actualiza C3/C2/C0 en x87Sw (sin tocar X16 ni X17).
+    const auto compareSwNative = [&] {
+        emitFcmpD(30, 31);
+        emitMovImm64(20, 0);
+        emitMovImm64(21, 0x4000u);
+        cselW(20, 21, 20, 0x0);  // EQ -> C3=1
+        emitMovImm64(21, 0x0100u);
+        cselW(20, 21, 20, 0x3);  // LO -> C0=1
+        emitMovImm64(21, 0x4500u);
+        cselW(20, 21, 20, 0x6);  // VS -> C3=C2=C0=1
+        ldH(21, 19, offSw);
+        emitMovImm64(22, 0x4500u);
+        emitWord(0x0A200000u | (22u << 16) | (21u << 5) | 21u);  // BIC W21, W21, W22
+        emitWord(0x2A000000u | (20u << 16) | (21u << 5) | 21u);  // ORR W21, W21, W20
+        stH(21, 19, offSw);
+    };
+    // Compara D30 con D31 y actualiza RFLAGS (ZF/PF/CF) + pfByte para FCOMI/FUCOMI(P).
+    const auto compareFlagsNative = [&] {
+        emitFcmpD(30, 31);
+        emitMovImm64(20, 0);
+        emitMovImm64(21, 0x40u);
+        cselW(20, 21, 20, 0x0);  // EQ -> ZF=1
+        emitMovImm64(21, 0x01u);
+        cselW(20, 21, 20, 0x3);  // LO -> CF=1
+        emitMovImm64(21, 0x45u);
+        cselW(20, 21, 20, 0x6);  // VS -> ZF=PF=CF=1
+        emitWord(0x53020A97u);   // UBFX W23, W20, #2, #1 (PF)
+        emitWord(0x520002F7u);   // EOR W23, W23, #1 -> pfByte = PF ? 0 : 1
+        emitStrB(23, 19, static_cast<int32_t>(offsetof(CpuContext, pfByte)));
+        emitLdrX(21, 19, static_cast<int32_t>(offsetof(CpuContext, rflags)));
+        emitMovImm64(22, ~0x8D5ULL);
+        emitAndReg(21, 21, 22, false, true);
+        emitOrrReg(21, 21, 20, true);
+        emitStrX(21, 19, static_cast<int32_t>(offsetof(CpuContext, rflags)));
+    };
+    // Redondea D30 según RC (bits 11:10) de x87Cw (0=nearest, 1=floor, 2=ceil, 3=trunc). Preserva X16 y X17.
+    const auto roundCwNative = [&] {
+        ldH(20, 19, offCw);
+        emitWord(0x530A2E94u);  // UBFX W20, W20, #10, #2
+        const uint32_t cbzPos = wordPos();
+        emitWord(0);            // CBZ W20, nearest
+        emitWord(0x71000E9Fu);  // CMP W20, #3
+        const uint32_t beqTrunc = wordPos();
+        emitWord(0);            // B.EQ trunc
+        emitWord(0x7100069Fu);  // CMP W20, #1
+        const uint32_t beqFloor = wordPos();
+        emitWord(0);            // B.EQ floor
+        emitWord(0x1E64C000u | (30u << 5) | 30u);  // FRINTP D30, D30 (ceil)
+        const uint32_t bDone1 = wordPos();
+        emitWord(0);
+        const uint32_t lblFloor = wordPos();
+        emitWord(0x1E654000u | (30u << 5) | 30u);  // FRINTM D30, D30 (floor)
+        const uint32_t bDone2 = wordPos();
+        emitWord(0);
+        const uint32_t lblTrunc = wordPos();
+        emitWord(0x1E65C000u | (30u << 5) | 30u);  // FRINTZ D30, D30 (trunc)
+        const uint32_t bDone3 = wordPos();
+        emitWord(0);
+        const uint32_t lblNearest = wordPos();
+        emitWord(0x1E644000u | (30u << 5) | 30u);  // FRINTN D30, D30 (nearest)
+        const uint32_t lblDone = wordPos();
+        patchWord(cbzPos, 0x34000000u | (static_cast<uint32_t>(lblNearest - cbzPos) << 5) | 20u);
+        patchWord(beqTrunc, 0x54000000u | (static_cast<uint32_t>(lblTrunc - beqTrunc) << 5) | 0x0u);
+        patchWord(beqFloor, 0x54000000u | (static_cast<uint32_t>(lblFloor - beqFloor) << 5) | 0x0u);
+        patchWord(bDone1, 0x14000000u | static_cast<uint32_t>(lblDone - bDone1));
+        patchWord(bDone2, 0x14000000u | static_cast<uint32_t>(lblDone - bDone2));
+        patchWord(bDone3, 0x14000000u | static_cast<uint32_t>(lblDone - bDone3));
+    };
+    // W17 = (x87Sw & ~0x3800) | ((x87Top & 7) << 11)
+    const auto computeSwW17 = [&] {
+        ldH(17, 19, offSw);
+        emitMovImm64(20, 0x3800u);
+        emitWord(0x0A200000u | (20u << 16) | (17u << 5) | 17u);  // BIC W17, W17, W20
+        emitLdrW(20, 19, offTop);
+        andW7(20);
+        emitWord(0x2A000000u | (20u << 16) | (11u << 10) | (17u << 5) | 17u);  // ORR W17, W17, W20, LSL #11
+    };
+    // D30 = D30 op D31 según el subcódigo de D8 (0 add, 1 mul, 4 sub, 5 subr, 6 div, 7 divr).
+    const auto arith = [&](unsigned s) -> bool {
+        const auto fop = [&](uint32_t base, uint8_t a, uint8_t b) {
+            emitWord(base | (static_cast<uint32_t>(b) << 16) | (static_cast<uint32_t>(a) << 5) | 30u);
+        };
+        switch (s) {
+            case 0: fop(0x1E602800u, 30, 31); return true;  // FADD
+            case 1: fop(0x1E600800u, 30, 31); return true;  // FMUL
+            case 4: fop(0x1E603800u, 30, 31); return true;  // FSUB  a - b
+            case 5: fop(0x1E603800u, 31, 30); return true;  // FSUBR b - a
+            case 6: fop(0x1E601800u, 30, 31); return true;  // FDIV  a / b
+            case 7: fop(0x1E601800u, 31, 30); return true;  // FDIVR b / a
+            default: return false;
+        }
+    };
+    const auto isArith = [](unsigned s) { return s != 2 && s != 3; };
+    if (mem) {
+        if (op == 0xD8 || op == 0xDC || op == 0xDA || op == 0xDE) {
+            if (op == 0xD8) {
+                emitWord(0xBD400000u | (16u << 5) | 31u);  // LDR S31, [X16]
+                emitWord(0x1E22C000u | (31u << 5) | 31u);  // FCVT D31, S31
+            } else if (op == 0xDC) {
+                ldD(31, 16, 0);
+            } else if (op == 0xDA) {
+                emitWord(0xB9400000u | (16u << 5) | 17u);  // LDR W17, [X16]
+                emitWord(0x1E620000u | (17u << 5) | 31u);  // SCVTF D31, W17
+            } else {
+                emitWord(0x79C00000u | (16u << 5) | 17u);  // LDRSH W17, [X16]
+                emitWord(0x1E620000u | (17u << 5) | 31u);  // SCVTF D31, W17
+            }
+            stAddr(17, 0);
+            ldD(30, 17, offSt);
+            if (isArith(sub)) {
+                arith(sub);
+                stD(30, 17, offSt);
+            } else {
+                compareSwNative();
+                if (sub == 3) pop();
+            }
+            return true;
+        }
+        if (op == 0xD9 && sub == 0) {
+            emitWord(0xBD400000u | (16u << 5) | 31u);
+            emitWord(0x1E22C000u | (31u << 5) | 31u);
+            push(31);
+            return true;
+        }
+        if (op == 0xDD && sub == 0) {
+            ldD(31, 16, 0);
+            push(31);
+            return true;
+        }
+        if (op == 0xDB && sub == 0) {  // FILD m32
+            emitWord(0xB9400000u | (16u << 5) | 17u);
+            emitWord(0x1E620000u | (17u << 5) | 31u);
+            push(31);
+            return true;
+        }
+        if (op == 0xDF && sub == 0) {  // FILD m16
+            emitWord(0x79C00000u | (16u << 5) | 17u);
+            emitWord(0x1E620000u | (17u << 5) | 31u);
+            push(31);
+            return true;
+        }
+        if (op == 0xDF && sub == 5) {  // FILD m64
+            emitWord(0xF9400000u | (16u << 5) | 17u);  // LDR X17, [X16]
+            emitWord(0x9E620000u | (17u << 5) | 31u);  // SCVTF D31, X17
+            push(31);
+            return true;
+        }
+        if ((op == 0xD9 || op == 0xDD) && (sub == 2 || sub == 3)) {
+            stAddr(17, 0);
+            ldD(30, 17, offSt);
+            if (op == 0xD9) {
+                emitWord(0x1E624000u | (30u << 5) | 30u);  // FCVT S30, D30
+                emitWord(0xBD000000u | (16u << 5) | 30u);  // STR S30, [X16]
+            } else {
+                stD(30, 16, 0);
+            }
+            if (sub == 3) pop();
+            return true;
+        }
+        if (op == 0xD9 && sub == 5) {  // FLDCW m16
+            ldH(17, 16, 0);
+            stH(17, 19, offCw);
+            return true;
+        }
+        if (op == 0xD9 && sub == 7) {  // FNSTCW m16
+            ldH(17, 19, offCw);
+            stH(17, 16, 0);
+            return true;
+        }
+        if (op == 0xDD && sub == 7) {  // FNSTSW m16
+            computeSwW17();
+            stH(17, 16, 0);
+            return true;
+        }
+        if ((op == 0xDB || op == 0xDF) && (sub == 1 || sub == 2 || sub == 3)) {  // FISTTP/FIST/FISTP m32/m16
+            stAddr(17, 0);
+            ldD(30, 17, offSt);
+            if (sub != 1) roundCwNative();
+            emitWord(0x1E780000u | (30u << 5) | 17u);  // FCVTZS W17, D30
+            if (op == 0xDB) emitWord(0xB9000000u | (16u << 5) | 17u);  // STR W17, [X16]
+            else stH(17, 16, 0);                                      // STRH W17, [X16]
+            if (sub == 1 || sub == 3) pop();
+            return true;
+        }
+        if ((op == 0xDD && sub == 1) || (op == 0xDF && sub == 7)) {  // FISTTP/FISTP m64
+            stAddr(17, 0);
+            ldD(30, 17, offSt);
+            if (op == 0xDF) roundCwNative();
+            emitWord(0x9E780000u | (30u << 5) | 17u);  // FCVTZS X17, D30
+            emitWord(0xF9000000u | (16u << 5) | 17u);  // STR X17, [X16]
+            pop();
+            return true;
+        }
+        return false;
+    }
+    if (op == 0xD8) {  // ST(0) = ST(0) op ST(i) / FCOM(P) ST(i)
+        stAddr(17, i);
+        ldD(31, 17, offSt);
+        stAddr(17, 0);
+        ldD(30, 17, offSt);
+        if (isArith(sub)) {
+            arith(sub);
+            stD(30, 17, offSt);
+        } else {
+            compareSwNative();
+            if (sub == 3) pop();
+        }
+        return true;
+    }
+    if (op == 0xDC || op == 0xDE) {
+        if (op == 0xDC && !isArith(sub)) {  // FCOM(P) ST(i) alias
+            stAddr(17, i);
+            ldD(31, 17, offSt);
+            stAddr(17, 0);
+            ldD(30, 17, offSt);
+            compareSwNative();
+            if (sub == 3) pop();
+            return true;
+        }
+        if (op == 0xDE && sub == 3 && i == 1) {  // FCOMPP
+            stAddr(17, 1);
+            ldD(31, 17, offSt);
+            stAddr(17, 0);
+            ldD(30, 17, offSt);
+            compareSwNative();
+            pop();
+            pop();
+            return true;
+        }
+        if (!isArith(sub)) return false;
+        // ST(i) = ST(i) op' ST(0) (+ pop en DE)
+        stAddr(17, 0);
+        ldD(31, 17, offSt);
+        stAddr(17, i);
+        ldD(30, 17, offSt);
+        arith(sub ^ (sub >= 4 ? 1u : 0u));
+        stD(30, 17, offSt);
+        if (op == 0xDE) pop();
+        return true;
+    }
+    if (op == 0xDA && modrm == 0xE9) {  // FUCOMPP
+        stAddr(17, 1);
+        ldD(31, 17, offSt);
+        stAddr(17, 0);
+        ldD(30, 17, offSt);
+        compareSwNative();
+        pop();
+        pop();
+        return true;
+    }
+    if (op == 0xD9) {
+        if (sub == 0) {  // FLD ST(i)
+            stAddr(17, i);
+            ldD(31, 17, offSt);
+            push(31);
+            return true;
+        }
+        if (sub == 1) {  // FXCH ST(i)
+            stAddr(17, 0);
+            stAddr(16, i);
+            ldD(30, 17, offSt);
+            ldD(31, 16, offSt);
+            stD(31, 17, offSt);
+            stD(30, 16, offSt);
+            return true;
+        }
+        switch (modrm) {
+            case 0xD0: return true;  // FNOP
+            case 0xE0:  // FCHS
+                stAddr(17, 0);
+                ldD(30, 17, offSt);
+                emitWord(0x1E614000u | (30u << 5) | 30u);  // FNEG D30, D30
+                stD(30, 17, offSt);
+                return true;
+            case 0xE1:  // FABS
+                stAddr(17, 0);
+                ldD(30, 17, offSt);
+                emitWord(0x1E60C000u | (30u << 5) | 30u);  // FABS D30, D30
+                stD(30, 17, offSt);
+                return true;
+            case 0xE4:  // FTST
+                stAddr(17, 0);
+                ldD(30, 17, offSt);
+                emitWord(0x9E6703FFu);  // FMOV D31, XZR (0.0)
+                compareSwNative();
+                return true;
+            case 0xE5: {  // FXAM: C1=signbit, vacío=C0|C3(0x4100), NaN=C0(0x0100), Inf=C0|C2(0x0500), 0=C3(0x4000), normal=C2(0x0400)
+                emitLdrW(17, 19, offTop);
+                andW7(17);
+                bitW22();  // W22 = 1 << top
+                emitLdrW(16, 19, offTag);
+                emitAddRegShift(17, 19, 17, 3, true);
+                ldD(30, 17, offSt);
+                emitWord(0x9E660000u | (30u << 5) | 20u);  // FMOV X20, D30
+                emitWord(0xD37FFC00u | (20u << 5) | 21u);  // LSR X21, X20, #63
+                emitLslImm(21, 21, 9, false);              // W21 = signbit << 9 (C1)
+                emitWord(0x6A00001Fu | (22u << 16) | (16u << 5));  // TST W16, W22
+                const uint32_t beqEmpty = wordPos();
+                emitWord(0);
+                emitMovImm64(22, 0x7FFFFFFFFFFFFFFFull);
+                emitAndReg(22, 20, 22, false, true);
+                const uint32_t cbzZero = wordPos();
+                emitWord(0);
+                emitWord(0xD374F800u | (20u << 5) | 22u);  // UBFX X22, X20, #52, #11 (exp)
+                emitWord(0xF100001Fu | (0x7FFu << 10) | (22u << 5));  // CMP X22, #0x7FF
+                const uint32_t bneNormal = wordPos();
+                emitWord(0);
+                emitWord(0xD3400000u | (1u << 22) | (51u << 10) | (20u << 5) | 22u);  // UBFX X22, X20, #0, #52
+                const uint32_t cbzInf = wordPos();
+                emitWord(0);
+                emitMovImm64(20, 0x0100u);  // NaN -> C0
+                const uint32_t bNan = wordPos();
+                emitWord(0);
+                const uint32_t lblInf = wordPos();
+                emitMovImm64(20, 0x0500u);  // Inf -> C0|C2
+                const uint32_t bInf = wordPos();
+                emitWord(0);
+                const uint32_t lblNormal = wordPos();
+                emitMovImm64(20, 0x0400u);  // normal -> C2
+                const uint32_t bNormal = wordPos();
+                emitWord(0);
+                const uint32_t lblZero = wordPos();
+                emitMovImm64(20, 0x4000u);  // zero -> C3
+                const uint32_t bZero = wordPos();
+                emitWord(0);
+                const uint32_t lblEmpty = wordPos();
+                emitMovImm64(20, 0x4100u);  // empty -> C0|C3
+                const uint32_t lblDone = wordPos();
+                patchWord(beqEmpty, 0x54000000u | (static_cast<uint32_t>(lblEmpty - beqEmpty) << 5) | 0x0u);
+                patchWord(cbzZero, 0xB4000000u | (static_cast<uint32_t>(lblZero - cbzZero) << 5) | 22u);
+                patchWord(bneNormal, 0x54000000u | (static_cast<uint32_t>(lblNormal - bneNormal) << 5) | 0x1u);
+                patchWord(cbzInf, 0xB4000000u | (static_cast<uint32_t>(lblInf - cbzInf) << 5) | 22u);
+                patchWord(bNan, 0x14000000u | static_cast<uint32_t>(lblDone - bNan));
+                patchWord(bInf, 0x14000000u | static_cast<uint32_t>(lblDone - bInf));
+                patchWord(bNormal, 0x14000000u | static_cast<uint32_t>(lblDone - bNormal));
+                patchWord(bZero, 0x14000000u | static_cast<uint32_t>(lblDone - bZero));
+                emitWord(0x2A000000u | (21u << 16) | (20u << 5) | 20u);  // ORR W20, W20, W21 (C1)
+                ldH(21, 19, offSw);
+                emitMovImm64(22, 0x4700u);
+                emitWord(0x0A200000u | (22u << 16) | (21u << 5) | 21u);  // BIC W21, W21, W22
+                emitWord(0x2A000000u | (20u << 16) | (21u << 5) | 21u);  // ORR W21, W21, W20
+                stH(21, 19, offSw);
+                return true;
+            }
+            case 0xE8:  // FLD1
+                emitWord(0x1E6E1000u | 31u);  // FMOV D31, #1.0
+                push(31);
+                return true;
+            case 0xEE:  // FLDZ
+                emitWord(0x9E6703FFu);  // FMOV D31, XZR (0.0)
+                push(31);
+                return true;
+            case 0xF6:  // FDECSTP
+                emitLdrW(17, 19, offTop);
+                emitSubImm(17, 17, 1, false);
+                andW7(17);
+                emitStrW(17, 19, offTop);
+                return true;
+            case 0xF7:  // FINCSTP
+                emitLdrW(17, 19, offTop);
+                emitAddImm(17, 17, 1, false);
+                andW7(17);
+                emitStrW(17, 19, offTop);
+                return true;
+            case 0xFA:  // FSQRT
+                stAddr(17, 0);
+                ldD(30, 17, offSt);
+                emitWord(0x1E61C000u | (30u << 5) | 30u);  // FSQRT D30, D30
+                stD(30, 17, offSt);
+                return true;
+            case 0xFE:  // FSIN directo (sin pasar por el switch de executeX87)
+            case 0xFF:  // FCOS directo
+            case 0xF3: {  // FPATAN directo
+                const uintptr_t fn = modrm == 0xFE ? reinterpret_cast<uintptr_t>(&x87Fsin)
+                                     : modrm == 0xFF ? reinterpret_cast<uintptr_t>(&x87Fcos)
+                                                     : reinterpret_cast<uintptr_t>(&x87Fpatan);
+                const int32_t simdOffset = static_cast<int32_t>(offsetof(CpuContext, simd));
+                const uint32_t simdCount = mode32_ ? 8u : 16u;
+                for (uint32_t s = 0; s < simdCount; ++s) {
+                    const uint8_t reg = s < 8 ? static_cast<uint8_t>(s) : static_cast<uint8_t>(s + 8);
+                    emitStrQ(reg, 19, simdOffset + static_cast<int32_t>(s * 16));
+                }
+                for (uint8_t g = 0; g < 8; ++g) {
+                    emitStpX(static_cast<uint8_t>(g * 2), static_cast<uint8_t>(g * 2 + 1), 19, static_cast<int32_t>(g * 16));
+                }
+                emitWord(0xD53B4211u);  // MRS X17, NZCV
+                emitStrX(17, 19, static_cast<int32_t>(offsetof(CpuContext, nzcv)));
+                emitMovReg(0, 19, true);
+                emitMovHostAddr(16, fn, kJitRelocLib);
+                emitStpPre(29, 30, 31, -2);
+                emitBlr(16);
+                emitLdpPost(29, 30, 31, 2);
+                emitLdrX(17, 19, static_cast<int32_t>(offsetof(CpuContext, nzcv)));
+                emitWord(0xD51B4211u);  // MSR NZCV, X17
+                for (uint8_t g = 0; g < 8; ++g) {
+                    emitLdpX(static_cast<uint8_t>(g * 2), static_cast<uint8_t>(g * 2 + 1), 19, static_cast<int32_t>(g * 16));
+                }
+                for (uint32_t s = 0; s < simdCount; ++s) {
+                    const uint8_t reg = s < 8 ? static_cast<uint8_t>(s) : static_cast<uint8_t>(s + 8);
+                    emitLdrQ(reg, 19, simdOffset + static_cast<int32_t>(s * 16));
+                }
+                return true;
+            }
+            case 0xFC:  // FRNDINT
+                stAddr(17, 0);
+                ldD(30, 17, offSt);
+                roundCwNative();
+                stD(30, 17, offSt);
+                return true;
+            default: break;
+        }
+        return false;
+    }
+    if (op == 0xDB) {
+        if (modrm == 0xE2) {  // FNCLEX
+            ldH(17, 19, offSw);
+            emitMovImm64(20, 0x7F00u);
+            emitAndReg(17, 17, 20, false, false);
+            stH(17, 19, offSw);
+            return true;
+        }
+        if (modrm == 0xE3) {  // FNINIT
+            emitStrW(31, 19, offTop);
+            emitStrW(31, 19, offTag);
+            stH(31, 19, offSw);
+            emitMovImm64(17, 0x037Fu);
+            stH(17, 19, offCw);
+            return true;
+        }
+        if (sub == 5 || sub == 6) {  // FUCOMI / FCOMI
+            stAddr(17, i);
+            ldD(31, 17, offSt);
+            stAddr(17, 0);
+            ldD(30, 17, offSt);
+            compareFlagsNative();
+            return true;
+        }
+        return false;
+    }
+    if (op == 0xDD) {
+        if (sub == 0) {  // FFREE ST(i)
+            emitLdrW(17, 19, offTop);
+            if (i != 0) emitAddImm(17, 17, static_cast<uint16_t>(i), false);
+            andW7(17);
+            bitW22();
+            emitLdrW(16, 19, offTag);
+            emitWord(0x0A200000u | (22u << 16) | (16u << 5) | 16u);  // BIC W16, W16, W22
+            emitStrW(16, 19, offTag);
+            return true;
+        }
+        if (sub == 2 || sub == 3) {  // FST / FSTP ST(i)
+            stAddr(17, 0);
+            ldD(30, 17, offSt);
+            stAddr(17, i);
+            stD(30, 17, offSt);
+            if (sub == 3) pop();
+            return true;
+        }
+        if (sub == 4 || sub == 5) {  // FUCOM / FUCOMP ST(i)
+            stAddr(17, i);
+            ldD(31, 17, offSt);
+            stAddr(17, 0);
+            ldD(30, 17, offSt);
+            compareSwNative();
+            if (sub == 5) pop();
+            return true;
+        }
+        return false;
+    }
+    if (op == 0xDF) {
+        if (modrm == 0xE0) {  // FNSTSW AX
+            computeSwW17();
+            emitBfi(0, 17, 0, 16);
+            return true;
+        }
+        if (sub == 5 || sub == 6) {  // FUCOMIP / FCOMIP
+            stAddr(17, i);
+            ldD(31, 17, offSt);
+            stAddr(17, 0);
+            ldD(30, 17, offSt);
+            compareFlagsNative();
+            pop();
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 void OryonEmitterBackend::emitX87Call(uint8_t op, uint8_t modrm, bool hasEa) {
     const int32_t simdOffset = static_cast<int32_t>(offsetof(CpuContext, simd));
     const int32_t nzcvOffset = static_cast<int32_t>(offsetof(CpuContext, nzcv));
@@ -8426,21 +9079,23 @@ size_t OryonEmitterBackend::decodeAndEmitOne(CodeReader& reader, uintptr_t rip,
                                                                   : (0xC0u | (groupExt << 3) | (m.rm & 7u)));
         // FCMOVcc (DA/DB C0..DF) lee los flags del huésped: no soportado todavía.
         if (!m.isMemory && (op == 0xDA || op == 0xDB) && groupExt <= 3) return fail("x87 FCMOVcc no soportado");
-        // FCOMI/FUCOMI(P) escriben RFLAGS: el bloque termina tras la instrucción (como PCMPISTRI).
+        // FCOMI/FUCOMI(P) escriben RFLAGS: si caen al intérprete, el bloque termina tras la instrucción.
         const bool setsFlags = !m.isMemory && (op == 0xDB || op == 0xDF) && (groupExt == 5 || groupExt == 6);
         if (m.isMemory) emitEffectiveAddress(m, nextRip());  // X16 = dirección efectiva
-        emitX87Call(op, modrmByte, m.isMemory);
-        if (setsFlags) {
-            emitWriteRipImm(nextRip());
-            emitStrX(31, 19, static_cast<int32_t>(offsetof(CpuContext, exitSite)));  // sin salida enlazable
-            emitLdpPost(27, 28, 31, 2);
-            emitLdpPost(25, 26, 31, 2);
-            emitLdpPost(23, 24, 31, 2);
-            emitLdpPost(21, 22, 31, 2);
-            emitLdpPost(19, 20, 31, 2);
-            emitLdpPost(29, 30, 31, 2);
-            emitRet();
-            isControlFlow = true;
+        if (!emitX87Native(op, modrmByte, m.isMemory)) {
+            emitX87Call(op, modrmByte, m.isMemory);
+            if (setsFlags) {
+                emitWriteRipImm(nextRip());
+                emitStrX(31, 19, static_cast<int32_t>(offsetof(CpuContext, exitSite)));  // sin salida enlazable
+                emitLdpPost(27, 28, 31, 2);
+                emitLdpPost(25, 26, 31, 2);
+                emitLdpPost(23, 24, 31, 2);
+                emitLdpPost(21, 22, 31, 2);
+                emitLdpPost(19, 20, 31, 2);
+                emitLdpPost(29, 30, 31, 2);
+                emitRet();
+                isControlFlow = true;
+            }
         }
         return finish();
     }
@@ -8458,7 +9113,7 @@ size_t OryonEmitterBackend::decodeAndEmitOne(CodeReader& reader, uintptr_t rip,
         }
         emitAddImm(4, 4, stackSize, true, false);
         if (extra != 0) emitAddImm(4, 4, extra, true, false);
-        if (!mode32_ && stackSize == 8 && returnStack.load(std::memory_order_relaxed)) {
+        if (returnStack.load(std::memory_order_relaxed)) {
             // Pila de retornos: saca ras[rasTop-- & 63]; si su RIP coincide con la dirección de
             // retorno real, RET X20 a la continuación (predicha por el núcleo). Si no (longjmp,
             // excepciones, pilas manipuladas), la búsqueda normal: el resultado es el mismo.
@@ -9821,7 +10476,7 @@ size_t OryonEmitterBackend::decodeAndEmitOne(CodeReader& reader, uintptr_t rip,
             } else {
                 emitStrW(17, 4, 0);
             }
-            if (!mode32_ && returnStack.load(std::memory_order_relaxed)) {
+            if (returnStack.load(std::memory_order_relaxed)) {
                 // Pila de retornos: entrada = ras[++rasTop & 63] = {RIP de retorno, continuación}.
                 // BL al trampolín de llamada: X30 = continuación (y el predictor de retornos del
                 // núcleo la apila); el RET del huésped vuelve con RET X20 directo aquí.
@@ -9839,6 +10494,12 @@ size_t OryonEmitterBackend::decodeAndEmitOne(CodeReader& reader, uintptr_t rip,
                 emitStpX(17, 30, 21, 0);  // {RIP de retorno, X30 = continuación}
             }
         }
+        if (op == 0xE9 && stitchBudget_ > 0 && target > rip &&
+            (target & ~uintptr_t{0xFFFull}) == (curBlockRip_ & ~uintptr_t{0xFFFull}) &&
+            target < stitchLimit_) {
+            stitchTarget_ = target;
+            return finish();
+        }
         emitLinkableExit(target);
         isControlFlow = true;
         return finish();
@@ -9849,6 +10510,12 @@ size_t OryonEmitterBackend::decodeAndEmitOne(CodeReader& reader, uintptr_t rip,
         if (!reader.s8(rel8)) return fail("JMP rel8 truncado");
         uintptr_t target = nextRip() + static_cast<uintptr_t>(static_cast<int64_t>(rel8));
         if (mode32_) target &= 0xFFFFFFFFu;
+        if (stitchBudget_ > 0 && target > rip &&
+            (target & ~uintptr_t{0xFFFull}) == (curBlockRip_ & ~uintptr_t{0xFFFull}) &&
+            target < stitchLimit_) {
+            stitchTarget_ = target;
+            return finish();
+        }
         emitLinkableExit(target);
         isControlFlow = true;
         return finish();
@@ -9943,9 +10610,9 @@ size_t OryonEmitterBackend::decodeAndEmitOne(CodeReader& reader, uintptr_t rip,
                 fast32Indirect.load(std::memory_order_relaxed) != nullptr) {
                 emitMovImm64(17, fast32AliasBase.load(std::memory_order_relaxed));
                 emitSubReg(17, 16, 17, false, false);  // W17 = destino - base
-                emitWord(0x53147E31u);                 // LSR W17, W17, #20 (zona de 1 MB)
+                emitWord(0x53147E34u);                 // LSR W20, W17, #20 (zona de 1 MB; preserva W17)
                 const size_t notAlias = wordPos();
-                emitWord(0x35000011u);                 // CBNZ W17, normal (se parchea)
+                emitWord(0x35000014u);                 // CBNZ W20, normal (se parchea)
                 emitFastIndirect32(nextRip());
                 const size_t done = wordPos();
                 emitWord(0x14000000u);                 // B fin (se parchea)
@@ -9953,10 +10620,28 @@ size_t OryonEmitterBackend::decodeAndEmitOne(CodeReader& reader, uintptr_t rip,
                 emitSubImm(4, 4, stackSize, true, false);
                 emitMovImm64(17, nextRip());
                 emitStrW(17, 4, 0);
+                if (returnStack.load(std::memory_order_relaxed)) {
+                    const int32_t topOff = static_cast<int32_t>(offsetof(CpuContext, rasTop));
+                    emitLdrX(20, 19, topOff);
+                    emitAddImm(20, 20, 1, true);
+                    emitStrX(20, 19, topOff);
+                    emitWord(0x92401694u);  // AND X20, X20, #63
+                    emitAddImm(21, 19, static_cast<uint16_t>(offsetof(CpuContext, ras)), true);
+                    emitWord(0x8B1412B5u);  // ADD X21, X21, X20, LSL #4
+                    const size_t bl = wordPos();
+                    emitWord(0x94000000u);  // BL trampolín (se parchea)
+                    emitLinkableExit(nextRip());
+                    patchImm26(bl, wordPos());
+                    emitStpX(17, 30, 21, 0);
+                }
                 flagEvents_.push_back({FlagEventKind::Read, 0, 0});  // salida: los flags quedan vivos
                 emitStrW(16, 19, static_cast<int32_t>(offsetof(CpuContext, rip)));
-                pendingExits_.push_back({wordPos(), false, false});
-                emitWord(0x14000000u);                 // salida al despachador con RIP = destino
+                if (inlineDispatch.load(std::memory_order_relaxed)) {
+                    emitInlineDispatch();
+                } else {
+                    pendingExits_.push_back({wordPos(), false, false});
+                    emitWord(0x14000000u);
+                }
                 patchImm26(done, wordPos());
                 return finish();
             }
@@ -9997,6 +10682,17 @@ size_t OryonEmitterBackend::decodeAndEmitOne(CodeReader& reader, uintptr_t rip,
                 }
             } else {
                 emitMovReg(16, m.rm, operand64);
+            }
+            if (mode32_ && fastNativeCalls.load(std::memory_order_relaxed) &&
+                fast32AliasBase.load(std::memory_order_relaxed) != 0 &&
+                fast32Table.load(std::memory_order_relaxed) != nullptr) {
+                emitMovImm64(17, fast32AliasBase.load(std::memory_order_relaxed));
+                emitSubReg(17, 16, 17, false, false);  // W17 = destino - base
+                emitWord(0x53147E34u);                 // LSR W20, W17, #20
+                const size_t notAlias = wordPos();
+                emitWord(0x35000014u);                 // CBNZ W20, normal (se parchea)
+                emitFastIndirect32(nextRip(), true);
+                patchImm19(notAlias, wordPos());
             }
             emitWriteRipReg(16, stackSize == 8);
             isControlFlow = true;
@@ -10306,6 +11002,9 @@ TranslatedBlock* OryonEmitterBackend::compileLocked(const uint8_t* code, size_t 
     const bool probed = !probeRvas().empty() && probeMatches(baseRip);
     if (probed) emitProbeCall(baseRip);
     curBlockRip_ = baseRip;
+    stitchTarget_ = 0;
+    stitchLimit_ = baseRip + std::min(codeSize, kMaxGuestBytesPerBlock);
+    stitchBudget_ = 3;
     struct ClearBlockRip {
         uintptr_t& r;
         ~ClearBlockRip() { r = 0; }
@@ -10321,6 +11020,7 @@ TranslatedBlock* OryonEmitterBackend::compileLocked(const uint8_t* code, size_t 
         ++instrSeq_;  // nunca se repite entre bloques: "mov imm + call" solo dentro del mismo bloque
         instrStartWord_ = wordPos();
         eaIsStack_ = false;  // solo vale para la dirección calculada en esta instrucción
+        stitchTarget_ = 0;
         CodeReader reader{code + consumed, code + codeSize};
         bool instControl = false;
         const size_t length =
@@ -10329,6 +11029,11 @@ TranslatedBlock* OryonEmitterBackend::compileLocked(const uint8_t* code, size_t 
             jitOffset_ = savedOffset;
             if (lastError_.empty()) lastError_ = "instrucción x86 no soportada";
             return nullptr;
+        }
+        if (stitchTarget_ != 0) {
+            consumed = stitchTarget_ - baseRip;
+            --stitchBudget_;
+            continue;
         }
         consumed += length;
         if (instControl) {
@@ -10411,7 +11116,7 @@ uint32_t OryonEmitterBackend::aotConfigKey() const noexcept {
     // PSHUFB, CVT(T)PD2DQ, hallados con la prueba diferencial tools/jitdiff_gen.py).
     // 7: shifts/rotates de 32 bits con cuenta 0, OF de SHL/SHR 1, RCL/RCR, INC/DEC e IMUL de 16
     // bits, CBW/CWDE, SHLD/SHRD (prueba diferencial de enteros).
-    constexpr uint32_t kCodegenVersion = 8;  // 8: FPU x87 real (antes NOP)
+    constexpr uint32_t kCodegenVersion = 16;  // 16: RAS 32-bit, fastCache CALL r/m32, trace stitching, FSIN/FCOS/FPATAN directos
     uint32_t k = 0;
     k |= tsoMemory.load(std::memory_order_relaxed) ? 1u : 0u;
     k |= chainBlocks.load(std::memory_order_relaxed) ? 2u : 0u;
@@ -11526,7 +12231,8 @@ int64_t OryonEmitterBackend::executeEntry(void* entryPoint) {
             const uint64_t smc = s_smcWriteIdx.load(std::memory_order_relaxed);
             const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTime).count();
             const JitDiskCache& disk = JitDiskCache::instance();
-            LOGI("Oryon: Ejecutados %llu bloques JIT (RIP=%p) %lld ms trad=+%llu lento=+%llu thunks=+%llu smc=+%llu enlaces=%zu lejanos=%llu arena=%zuMB "
+            const uint64_t x87Fb = x87::s_fallbackCalls.load(std::memory_order_relaxed);
+            LOGI("Oryon: Ejecutados %llu bloques JIT (RIP=%p) %lld ms trad=+%llu lento=+%llu thunks=+%llu smc=+%llu enlaces=%zu lejanos=%llu arena=%zuMB x87fb=%llu "
                  "| JIT total %llu ms (todos los hilos), disco: %llu cargados aqui, %llu aciertos / %llu fallos / %llu guardados",
                  static_cast<unsigned long long>(step), reinterpret_cast<void*>(ctx_.rip), ms,
                  static_cast<unsigned long long>(statTranslations_ - lastT),
@@ -11534,9 +12240,34 @@ int64_t OryonEmitterBackend::executeEntry(void* entryPoint) {
                  static_cast<unsigned long long>(statThunks_ - lastK),
                  static_cast<unsigned long long>(smc - lastSmc), links_.size(),
                  static_cast<unsigned long long>(farLinks_), jitOffset_ >> 20,
+                 static_cast<unsigned long long>(x87Fb),
                  static_cast<unsigned long long>(s_jitNs.load(std::memory_order_relaxed) / 1000000u),
                  static_cast<unsigned long long>(statAotLoads_), static_cast<unsigned long long>(disk.hits()),
                  static_cast<unsigned long long>(disk.misses()), static_cast<unsigned long long>(disk.written()));
+            static std::atomic<uint64_t> s_lastHistTotal{0};
+            uint64_t prevHist = s_lastHistTotal.load(std::memory_order_relaxed);
+            if (x87Fb >= prevHist + 100000ull &&
+                s_lastHistTotal.compare_exchange_strong(prevHist, x87Fb, std::memory_order_relaxed)) {
+                uint32_t topCnt[3] = {0, 0, 0};
+                uint16_t topOp[3] = {0, 0, 0};
+                for (uint32_t k = 0; k < 8u * 256u; ++k) {
+                    const uint32_t c = x87::s_fallbackHist[k].load(std::memory_order_relaxed);
+                    if (c > topCnt[0]) {
+                        topCnt[2] = topCnt[1]; topOp[2] = topOp[1];
+                        topCnt[1] = topCnt[0]; topOp[1] = topOp[0];
+                        topCnt[0] = c; topOp[0] = static_cast<uint16_t>(k);
+                    } else if (c > topCnt[1]) {
+                        topCnt[2] = topCnt[1]; topOp[2] = topOp[1];
+                        topCnt[1] = c; topOp[1] = static_cast<uint16_t>(k);
+                    } else if (c > topCnt[2]) {
+                        topCnt[2] = c; topOp[2] = static_cast<uint16_t>(k);
+                    }
+                }
+                LOGI("x87 fallback top: %02X %02X=%u, %02X %02X=%u, %02X %02X=%u",
+                     0xD8u + (topOp[0] >> 8), topOp[0] & 0xFFu, topCnt[0],
+                     0xD8u + (topOp[1] >> 8), topOp[1] & 0xFFu, topCnt[1],
+                     0xD8u + (topOp[2] >> 8), topOp[2] & 0xFFu, topCnt[2]);
+            }
             lastT = statTranslations_;
             lastS = statSlowPath_;
             lastK = statThunks_;
